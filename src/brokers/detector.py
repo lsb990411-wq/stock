@@ -8,12 +8,17 @@ import pandas as pd
 
 from ..import_export import read_tabular
 from .base import BrokerParseResult, BrokerParser
+from .db_securities import DBSecuritiesParser
 from .kiwoom import KiwoomParser
 from .miraeasset import MiraeAssetParser
 from .pdf_parser import parse_broker_pdf
 
-PARSERS: list[BrokerParser] = [KiwoomParser(), MiraeAssetParser()]
-PDF_BROKERS = ["키움증권", "미래에셋증권", "한국투자증권"]
+PARSERS: list[BrokerParser] = [
+    KiwoomParser(),
+    MiraeAssetParser(),
+    DBSecuritiesParser(),
+]
+PDF_BROKERS = ["키움증권", "미래에셋증권", "한국투자증권", "DB금융투자"]
 
 
 def list_brokers() -> list[str]:

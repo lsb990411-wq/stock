@@ -1477,6 +1477,16 @@ class Storage:
         with self._connect() as conn:
             conn.execute("DELETE FROM trades")
 
+    def clear_trades_for_business(self, business_id: int) -> int:
+        """특정 사업자의 매매 거래만 전부 삭제. 삭제 건수 반환."""
+        bid = int(business_id)
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM trades WHERE business_id = ?",
+                (bid,),
+            )
+            return int(cur.rowcount or 0)
+
     # ------------------------------------------------------------------
     # Income (이자·배당) account / broker / records
     # ------------------------------------------------------------------

@@ -218,6 +218,8 @@ def trades_to_dataframe(trades: list[Trade]) -> pd.DataFrame:
         side_label = (
             "매수" if t.side == "BUY" else ("매도" if t.side == "SELL" else "배당")
         )
+        qty = float(t.quantity or 0)
+        price = float(t.price or 0)
         rows.append(
             {
                 "거래일자": t.trade_date,
@@ -225,8 +227,9 @@ def trades_to_dataframe(trades: list[Trade]) -> pd.DataFrame:
                 "종목코드": t.stock_code,
                 "종목명": t.stock_name,
                 "거래유형": side_label,
-                "수량": t.quantity,
-                "단가": t.price,
+                "수량": qty,
+                "거래금액(원가)": qty * price,
+                "단가": price,
                 "수수료": t.fee,
                 "제세금": getattr(t, "tax", 0) or 0,
                 "통화": getattr(t, "currency", "") or "",
@@ -235,16 +238,40 @@ def trades_to_dataframe(trades: list[Trade]) -> pd.DataFrame:
                 "정산금액": t.settlement_amount
                 if t.settlement_amount is not None
                 else (
-                    t.quantity * t.price + t.fee
+                    qty * price + t.fee
                     if t.side == "BUY"
-                    else t.quantity * t.price - t.fee
+                    else qty * price - t.fee
                 ),
                 "메모": t.memo,
                 "출처": t.source,
                 "ID": t.id,
             }
         )
-    return pd.DataFrame(rows, columns=[*STANDARD_COLUMNS, "출처", "ID"])
+    # STANDARD_COLUMNS + 표시용 원가 컬럼 + 메타
+    display_cols = [
+        "거래일자",
+        "사업자",
+        "종목코드",
+        "종목명",
+        "거래유형",
+        "수량",
+        "거래금액(원가)",
+        "단가",
+        "수수료",
+        "제세금",
+        "정산금액",
+        "메모",
+        "출처",
+        "ID",
+    ]
+    # 외화 메타는 값 있을 때만 붙임
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=display_cols)
+    extra = [c for c in ("통화", "환율", "외화단가") if c in df.columns]
+    ordered = [c for c in display_cols if c in df.columns]
+    # 정산금액 앞에 외화 정보가 있으면 삽입하지 않고 뒤에 유지하지 않음 — display에만 원가 포함
+    return df.loc[:, ordered]
 
 
 def positions_to_dataframe(positions) -> pd.DataFrame:

@@ -90,7 +90,7 @@ def ensure_side(value: Any) -> str:
 
 
 def to_standard_frame(rows: list[dict[str, Any]]) -> pd.DataFrame:
-    columns = [
+    base_columns = [
         "거래일자",
         "사업자",
         "종목코드",
@@ -99,7 +99,38 @@ def to_standard_frame(rows: list[dict[str, Any]]) -> pd.DataFrame:
         "수량",
         "단가",
         "수수료",
+        "제세금",
         "정산금액",
         "메모",
     ]
-    return pd.DataFrame(rows, columns=columns)
+    has_bal = any(isinstance(r, dict) and "유가금잔" in r for r in rows)
+    columns = (
+        [
+            "거래일자",
+            "사업자",
+            "종목코드",
+            "종목명",
+            "거래유형",
+            "수량",
+            "유가금잔",
+            "단가",
+            "수수료",
+            "제세금",
+            "정산금액",
+            "메모",
+        ]
+        if has_bal
+        else base_columns
+    )
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    df = pd.DataFrame(rows)
+    for c in columns:
+        if c not in df.columns:
+            df[c] = 0.0 if c in {"제세금", "수수료", "유가금잔"} else ""
+    out = df.loc[:, columns].copy()
+    if "제세금" in out.columns:
+        out["제세금"] = pd.to_numeric(out["제세금"], errors="coerce").fillna(0.0)
+    if "유가금잔" in out.columns:
+        out["유가금잔"] = pd.to_numeric(out["유가금잔"], errors="coerce")
+    return out
