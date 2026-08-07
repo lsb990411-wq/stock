@@ -1,0 +1,12 @@
+# Streamlit Community Cloud / GitHub 공유용 의존성
+streamlit>=1.32.0
+pandas>=2.0.0
+numpy>=1.26.0
+openpyxl>=3.1.0
+xlrd>=2.0.1
+pdfplumber>=0.11.0
+
+# 스캔(이미지) PDF OCR용 (선택) — Tesseract-OCR 본체는 OS에 별도 설치 필요
+# Streamlit Cloud에서는 OCR이 동작하지 않을 수 있음
+pytesseract>=0.3.10
+Pillow>=10.0.0
