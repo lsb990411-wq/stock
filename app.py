@@ -27,15 +27,6 @@ if str(ROOT) not in sys.path:
 from src.brokers import detect_and_parse, list_brokers
 from src.brokers.pdf_parser import OCR_TIP, empty_trade_rows
 from src.fifo import compute_positions
-from src.import_export import (
-    dataframe_to_trades,
-    export_to_csv_bytes,
-    export_to_excel_bytes,
-    import_standard_file,
-    positions_to_dataframe,
-    sell_results_to_dataframe,
-    trades_to_dataframe,
-)
 from src.legacy_journal import parse_legacy_journal_excel
 
 # Streamlit 핫리로드 시 stale sys.modules 방지
@@ -46,12 +37,14 @@ import src.storage as _storage_mod
 import src.voucher_export as _voucher_mod
 import src.income_parser as _income_parser_mod
 import src.income_voucher as _income_voucher_mod
+import src.import_export as _import_export_mod
 
 _models_mod = importlib.reload(_models_mod)
 _storage_mod = importlib.reload(_storage_mod)
 _voucher_mod = importlib.reload(_voucher_mod)
 _income_parser_mod = importlib.reload(_income_parser_mod)
 _income_voucher_mod = importlib.reload(_income_voucher_mod)
+_import_export_mod = importlib.reload(_import_export_mod)
 
 AccountConfig = _models_mod.AccountConfig
 IncomeAccountConfig = _models_mod.IncomeAccountConfig
@@ -69,6 +62,13 @@ parse_income_file = _income_parser_mod.parse_income_file
 rows_to_dataframe = _income_parser_mod.rows_to_dataframe
 export_income_voucher_excel_bytes = _income_voucher_mod.export_income_voucher_excel_bytes
 income_to_voucher_lines = _income_voucher_mod.income_to_voucher_lines
+dataframe_to_trades = _import_export_mod.dataframe_to_trades
+export_to_csv_bytes = _import_export_mod.export_to_csv_bytes
+export_to_excel_bytes = _import_export_mod.export_to_excel_bytes
+import_standard_file = _import_export_mod.import_standard_file
+positions_to_dataframe = _import_export_mod.positions_to_dataframe
+sell_results_to_dataframe = _import_export_mod.sell_results_to_dataframe
+trades_to_dataframe = _import_export_mod.trades_to_dataframe
 
 st.set_page_config(
     page_title="법인 주식 매매일지",
@@ -160,7 +160,7 @@ def inject_sidebar_styles() -> None:
     st.markdown(SIDEBAR_CUSTOM_CSS, unsafe_allow_html=True)
 
 
-STORAGE_CACHE_VERSION = 17  # Storage API 변경 시 증가 → 캐시 무효화
+STORAGE_CACHE_VERSION = 18  # Storage API 변경 시 증가 → 캐시 무효화
 
 
 @st.cache_resource
@@ -200,6 +200,7 @@ def get_storage() -> Storage:
         "list_income_records",
         "get_income_records_by_period",
         "list_broker_partners",
+        "clear_trades_for_business",
     )
     biz_ok = True
     stocks_ok = False
@@ -256,6 +257,9 @@ def trade_table_column_config() -> dict:
     """거래 내역 테이블 숫자 컬럼 천단위 쉼표 포맷."""
     return {
         "수량": st.column_config.NumberColumn("수량", format="%,d"),
+        "거래금액(원가)": st.column_config.NumberColumn(
+            "거래금액(원가)", format="%,d 원", help="수량 × 단가"
+        ),
         "단가": st.column_config.NumberColumn("단가", format="%,d 원"),
         "수수료": st.column_config.NumberColumn("수수료", format="%,d 원"),
         "제세금": st.column_config.NumberColumn("제세금", format="%,d 원"),
@@ -279,10 +283,68 @@ def _filter_stock_trades(
     if business_name and "사업자" in detail.columns:
         detail = detail[detail["사업자"].astype(str) == business_name]
     detail = detail.drop(columns=["출처"], errors="ignore")
-    for col in ("수량", "단가", "수수료", "제세금", "정산금액", "ID"):
+    # 핫리로드 stale 모듈 대비: 원가 컬럼 없으면 수량×단가로 즉시 생성
+    if "거래금액(원가)" not in detail.columns and {"수량", "단가"}.issubset(detail.columns):
+        detail["거래금액(원가)"] = (
+            pd.to_numeric(detail["수량"], errors="coerce").fillna(0)
+            * pd.to_numeric(detail["단가"], errors="coerce").fillna(0)
+        )
+    for col in ("수량", "거래금액(원가)", "단가", "수수료", "제세금", "정산금액", "ID"):
         if col in detail.columns:
             detail[col] = pd.to_numeric(detail[col], errors="coerce")
+
+    # 팝업: 시간순 정렬 (거래일자 → 거래일시 → ID)
+    detail = _sort_trades_chronologically(detail)
     return detail.reset_index(drop=True)
+
+
+def _sort_trades_chronologically(df: pd.DataFrame) -> pd.DataFrame:
+    """거래일자·거래일시(있으면)·매수우선·ID 기준 오름차순.
+
+    DB에 거래일시가 없어도, 시간순으로 넣은 거래는 ID 순서가 시간순에 대응한다.
+    동일 일자에는 매수가 매도보다 먼저 오도록 한다.
+    """
+    if df is None or df.empty:
+        return df
+    work = df.copy()
+    sort_by: list[str] = []
+    drop_tmp: list[str] = []
+
+    if "거래일자" in work.columns:
+        work["_sort_date"] = pd.to_datetime(work["거래일자"], errors="coerce")
+        sort_by.append("_sort_date")
+        drop_tmp.append("_sort_date")
+
+    if "거래일시" in work.columns:
+        work["_sort_time"] = (
+            work["거래일시"].fillna("00:00:00").astype(str).str.strip()
+        )
+        work.loc[
+            work["_sort_time"].isin({"", "nan", "None", "NaT"}),
+            "_sort_time",
+        ] = "00:00:00"
+        sort_by.append("_sort_time")
+        drop_tmp.append("_sort_time")
+
+    # 매수(0) → 매도(1)
+    side_col = "거래유형" if "거래유형" in work.columns else None
+    if side_col:
+        work["_sort_side"] = work[side_col].map(
+            lambda v: 0
+            if ("매수" in str(v) or "매입" in str(v) or "입고" in str(v))
+            else 1
+        )
+        sort_by.append("_sort_side")
+        drop_tmp.append("_sort_side")
+
+    if "ID" in work.columns:
+        sort_by.append("ID")
+
+    if not sort_by:
+        return work
+
+    work = work.sort_values(by=sort_by, ascending=True, kind="mergesort")
+    return work.drop(columns=drop_tmp, errors="ignore")
 
 
 DETAIL_TRADE_COLUMNS = [
@@ -290,6 +352,7 @@ DETAIL_TRADE_COLUMNS = [
     "종목명",
     "거래유형",
     "수량",
+    "거래금액(원가)",
     "단가",
     "수수료",
     "제세금",
@@ -359,7 +422,9 @@ def show_stock_detail_modal(
         return
 
     display_cols = [c for c in DETAIL_TRADE_COLUMNS if c in df_stock_trades.columns]
-    work = df_stock_trades.loc[:, [*display_cols, "ID"]].copy()
+    # 팝업 표시 직전 시간순 재정렬
+    sorted_src = _sort_trades_chronologically(df_stock_trades)
+    work = sorted_src.loc[:, [c for c in [*display_cols, "ID"] if c in sorted_src.columns]].copy()
     work["거래일자"] = pd.to_datetime(work["거래일자"], errors="coerce").dt.date
     work["ID"] = pd.to_numeric(work["ID"], errors="coerce").astype("Int64")
     original_dates = {
@@ -369,10 +434,13 @@ def show_stock_detail_modal(
     }
 
     # 조회용 표: 매수(빨강) / 매도(파랑) / 배당(초록)
-    view = work.loc[:, display_cols].copy()
+    view = work.loc[:, [c for c in display_cols if c in work.columns]].copy()
     detail_col_config = {
         "거래일자": st.column_config.DateColumn("거래일자", format="YYYY-MM-DD"),
         "수량": st.column_config.NumberColumn("수량", format="%,d"),
+        "거래금액(원가)": st.column_config.NumberColumn(
+            "거래금액(원가)", format="%,d 원", help="수량 × 단가"
+        ),
         "단가": st.column_config.NumberColumn("단가", format="%,d 원"),
         "수수료": st.column_config.NumberColumn("수수료", format="%,d 원"),
         "제세금": st.column_config.NumberColumn("제세금", format="%,d 원"),
@@ -1180,7 +1248,91 @@ def sidebar_business_selector(storage: Storage) -> int | None:
     # URL과 세션 최종 동기화 (콜백 외 경로·최초 진입 포함)
     sync_business_to_query(selected_id)
 
+    # 사업자 바로 아래 — 스크롤 없이 보이도록
+    sidebar_data_management(storage, selected_id)
+
     return selected_id
+
+
+@st.dialog("🗑️ 선택 사업자 거래 삭제")
+def confirm_clear_business_trades_dialog(
+    storage: Storage,
+    business_id: int,
+    business_name: str,
+) -> None:
+    """현재 선택 사업자의 매매 거래만 삭제 (종목·사업자 마스터는 유지)."""
+    db = get_storage()
+    trades = db.list_trades(business_id=int(business_id))
+    st.warning(
+        f"**[{business_name}]** 사업자의 매매 거래 **{len(trades):,}건**을 삭제합니다.\n\n"
+        "사업자·종목 마스터와 이자·배당 내역은 유지됩니다. 되돌릴 수 없습니다."
+    )
+    confirm = st.checkbox(
+        "위 안내를 확인했으며 삭제를 진행합니다.",
+        key=f"confirm_clear_trades_{business_id}",
+    )
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("취소", use_container_width=True, key="clear_trades_cancel"):
+            st.rerun()
+    with c2:
+        if st.button(
+            "🗑️ 삭제 실행",
+            type="primary",
+            use_container_width=True,
+            disabled=not confirm,
+            key="clear_trades_confirm",
+        ):
+            try:
+                n = db.clear_trades_for_business(int(business_id))
+                st.session_state["_pending_toast"] = (
+                    f"[{business_name}] 거래 {n:,}건이 삭제되었습니다."
+                )
+                # 증권사 변환기 임시 상태도 비움
+                for k in (
+                    "broker_edit_df",
+                    "broker_parse_token",
+                    "broker_parse_notes",
+                    "broker_parse_name",
+                ):
+                    st.session_state.pop(k, None)
+                st.rerun()
+            except Exception as exc:  # noqa: BLE001
+                st.error(str(exc))
+
+
+def sidebar_data_management(
+    storage: Storage,
+    business_id: int | None,
+) -> None:
+    """사이드바 데이터 관리 — 선택 사업자 거래 삭제."""
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("데이터 관리")
+    if business_id is None:
+        st.sidebar.caption("사업자를 선택하면 해당 사업자의 거래만 삭제할 수 있습니다.")
+        st.sidebar.button(
+            "🗑️ 선택 사업자 거래 삭제",
+            use_container_width=True,
+            disabled=True,
+            key="sidebar_clear_trades_disabled",
+            help="사이드바에서 사업자를 먼저 선택하세요 (전체 제외)",
+        )
+        return
+
+    biz_name = next(
+        (b.name for b in storage.list_businesses() if b.id == business_id),
+        str(business_id),
+    )
+    trade_n = len(storage.list_trades(business_id=business_id))
+    st.sidebar.caption(f"대상: **{biz_name}** · 거래 {trade_n:,}건")
+    if st.sidebar.button(
+        "🗑️ 선택 사업자 거래 삭제",
+        use_container_width=True,
+        type="secondary",
+        key="sidebar_clear_trades",
+        help="선택한 사업자의 매매 거래만 삭제합니다",
+    ):
+        confirm_clear_business_trades_dialog(storage, int(business_id), biz_name)
 
 
 def _activate_menu(menu_key: str) -> None:
@@ -1558,6 +1710,7 @@ def _render_overseas_trade_list(storage: Storage, business_id: int | None) -> No
                 "티커": t.stock_code,
                 "종목명": t.stock_name,
                 "수량": t.quantity,
+                "거래금액(원가)": float(t.quantity or 0) * float(t.price or 0),
                 "외화단가": getattr(t, "price_fx", 0) or 0,
                 "환율": getattr(t, "fx_rate", 0) or 0,
                 "통화": getattr(t, "currency", "") or "",
@@ -1566,8 +1719,24 @@ def _render_overseas_trade_list(storage: Storage, business_id: int | None) -> No
                 "원화장산": t.settlement_amount,
             }
         )
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
+    odf = pd.DataFrame(rows)
+    st.dataframe(
+        odf,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "수량": st.column_config.NumberColumn("수량", format="%,.4f"),
+            "거래금액(원가)": st.column_config.NumberColumn(
+                "거래금액(원가)", format="%,d 원", help="수량 × 원화단가"
+            ),
+            "외화단가": st.column_config.NumberColumn("외화단가", format="%.4f"),
+            "환율": st.column_config.NumberColumn("환율", format="%.2f"),
+            "원화단가": st.column_config.NumberColumn("원화단가", format="%,d 원"),
+            "원화수수료": st.column_config.NumberColumn("원화수수료", format="%,d 원"),
+            "원화장산": st.column_config.NumberColumn("원화장산", format="%,d 원"),
+            "ID": st.column_config.NumberColumn("ID", format="%d"),
+        },
+    )
 
 def page_trades(
     storage: Storage,
@@ -1798,9 +1967,29 @@ def _render_trade_list(
         return
 
     view = df.drop(columns=["출처"], errors="ignore").copy()
-    for col in ("수량", "단가", "수수료", "제세금", "정산금액", "ID"):
+    for col in ("수량", "거래금액(원가)", "단가", "수수료", "제세금", "정산금액", "ID"):
         if col in view.columns:
             view[col] = pd.to_numeric(view[col], errors="coerce")
+
+    # 표시 순서: 수량 → 거래금액(원가) → 단가 …
+    preferred = [
+        "거래일자",
+        "사업자",
+        "종목코드",
+        "종목명",
+        "거래유형",
+        "수량",
+        "거래금액(원가)",
+        "단가",
+        "수수료",
+        "제세금",
+        "정산금액",
+        "메모",
+        "ID",
+    ]
+    ordered = [c for c in preferred if c in view.columns]
+    ordered += [c for c in view.columns if c not in ordered]
+    view = view.loc[:, ordered]
 
     st.dataframe(
         view,
@@ -2183,7 +2372,7 @@ def page_broker(
         return
     st.subheader("증권사 거래내역 변환기")
     st.caption(
-        "키움 / 미래에셋 / 한국투자 등 CSV·Excel·PDF 거래내역을 변환한 뒤, "
+        "키움 / 미래에셋 / DB금융투자 / 한국투자 등 CSV·Excel·PDF 거래내역을 변환한 뒤, "
         "검수·수정 후 매매일지에 반영합니다."
     )
 
@@ -2284,8 +2473,15 @@ def page_broker(
             "거래유형", options=["매수", "매도"], required=True
         ),
         "수량": st.column_config.NumberColumn("수량", min_value=0, step=1, format="%g"),
+        "유가금잔": st.column_config.NumberColumn(
+            "유가금잔",
+            format="%g",
+            help="시간순 정렬 후 종목별 매수(+)/매도(-) 누적 잔여수량",
+            disabled=True,
+        ),
         "단가": st.column_config.NumberColumn("단가", min_value=0, step=1, format="%g"),
         "수수료": st.column_config.NumberColumn("수수료", min_value=0, step=1, format="%g"),
+        "제세금": st.column_config.NumberColumn("제세금", min_value=0, step=1, format="%g"),
         "정산금액": st.column_config.NumberColumn("정산금액", step=1, format="%g"),
         "메모": st.column_config.TextColumn("메모"),
     }
@@ -3340,7 +3536,7 @@ def main() -> None:
     if pending_toast:
         st.toast(pending_toast)
 
-    # 사이드바: 사업자 → 트리형(펼침) 메뉴
+    # 사이드바: 사업자(+데이터 관리) → 트리형 메뉴
     business_id = sidebar_business_selector(storage)
     st.sidebar.divider()
     menu = sidebar_tree_menu()
