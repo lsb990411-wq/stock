@@ -19,14 +19,14 @@ class KiwoomParser(BrokerParser):
     name = "키움증권"
     aliases = ["키움", "kiwoom", "영웅문"]
 
-    DATE_CANDS = ["체결일", "거래일", "주문일", "일자", "매매일자"]
+    DATE_CANDS = ["거래일자", "체결일", "거래일", "주문일", "일자", "매매일자"]
     CODE_CANDS = ["종목코드", "종목번호", "단축코드", "코드"]
     NAME_CANDS = ["종목명", "종목"]
-    SIDE_CANDS = ["매매구분", "주문구분", "거래구분", "구분", "매수매도"]
-    QTY_CANDS = ["체결수량", "주문수량", "수량", "거래수량"]
-    PRICE_CANDS = ["체결가", "체결단가", "매매가", "단가", "가격"]
+    SIDE_CANDS = ["거래유형", "매매구분", "주문구분", "거래구분", "구분", "매수매도"]
+    QTY_CANDS = ["수량", "체결수량", "주문수량", "거래수량"]
+    PRICE_CANDS = ["단가", "체결가", "체결단가", "매매가", "가격"]
     FEE_CANDS = ["수수료", "수수료합", "제비용"]
-    TAX_CANDS = ["거래세", "제세금", "세금"]
+    TAX_CANDS = ["제세금", "거래세", "세금"]
     AMT_CANDS = ["정산금액", "결제금액", "거래금액", "체결금액", "금액"]
 
     def score(self, df: pd.DataFrame, filename: str = "") -> float:

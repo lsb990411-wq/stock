@@ -59,11 +59,11 @@ class DBSecuritiesParser(BrokerParser):
     TIME_CANDS = ["거래일시", "체결시각", "체결시간", "거래시간", "시간"]
     CODE_CANDS = ["종목코드", "종목번호", "단축코드"]
     NAME_CANDS = ["종목명", "종목"]
-    SIDE_CANDS = ["거래구분", "매매구분", "주문구분", "매수매도"]
-    QTY_CANDS = ["거래수량", "체결수량", "수량"]
-    PRICE_CANDS = ["거래단가", "체결단가", "체결가", "단가"]
+    SIDE_CANDS = ["거래유형", "거래구분", "매매구분", "주문구분", "매수매도"]
+    QTY_CANDS = ["수량", "거래수량", "체결수량"]
+    PRICE_CANDS = ["단가", "거래단가", "체결단가", "체결가"]
     FEE_CANDS = ["수수료", "위탁수수료"]
-    TAX_CANDS = ["세금", "거래세", "제세금"]
+    TAX_CANDS = ["제세금", "세금", "거래세"]
     AMT_CANDS = ["정산금액", "결제금액", "거래금액"]
 
     def score(self, df: pd.DataFrame, filename: str = "") -> float:

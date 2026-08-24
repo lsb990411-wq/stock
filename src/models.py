@@ -38,6 +38,34 @@ def normalize_currency(value: str | None) -> str:
     return text if text else "USD"
 
 
+def coerce_fx_rate(value: Any) -> float:
+    """환율 값 정규화. 비어 있거나 파싱 불가면 추정하지 않고 0.0.
+
+    공란·None·NaN·'-' 등은 모두 0으로 등록한다.
+    """
+    if value is None:
+        return 0.0
+    try:
+        if isinstance(value, float) and value != value:  # NaN
+            return 0.0
+    except Exception:  # noqa: BLE001
+        pass
+    if isinstance(value, (int, float)):
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        return v if v > 0 else 0.0
+    text = str(value).strip().replace(",", "").replace("원", "").replace("₩", "")
+    if not text or text.lower() in {"nan", "none", "null", "-", "."}:
+        return 0.0
+    try:
+        v = float(text)
+    except ValueError:
+        return 0.0
+    return v if v > 0 else 0.0
+
+
 @dataclass
 class Business:
     id: int | None
@@ -104,13 +132,23 @@ class Trade:
     price_fx: float = 0.0  # 외화 단가
     fee_fx: float = 0.0
     tax_fx: float = 0.0
+    # 증권사/계좌 (Account 마스터)
+    account_id: int | None = None
+    # 사용자 지정 처분손익(원). None이면 FIFO 계산값 사용
+    disposal_pnl: float | None = None
     # join fields (optional)
     business_name: str = ""
     stock_code: str = ""
     stock_name: str = ""
+    stock_market: str = ""
+    account_name: str = ""
 
     @property
     def is_overseas(self) -> bool:
+        if normalize_market(self.stock_market) == MARKET_OVERSEAS:
+            return True
+        if float(self.price_fx or 0) > 0:
+            return True
         return float(self.fx_rate or 0) > 0 and normalize_currency(self.currency) != "KRW"
 
     def to_dict(self) -> dict[str, Any]:
@@ -132,6 +170,8 @@ class Lot:
     stock_code: str = ""
     stock_name: str = ""
     business_name: str = ""
+    account_id: int | None = None
+    account_name: str = ""
 
     @property
     def remaining_fee(self) -> float:
@@ -171,14 +211,18 @@ class SellResult:
     realized_pnl: float
     matches: list[MatchDetail] = field(default_factory=list)
     shortfall_qty: float = 0.0
+    book_cost: float = 0.0  # FIFO 매수원가 (수량×매수단가)
+    disposal_pnl: float = 0.0  # 전표 처분손익 = 정산+수수료+세 - 매수원가
     stock_code: str = ""
     stock_name: str = ""
     business_name: str = ""
+    account_id: int | None = None
+    account_name: str = ""
 
 
 @dataclass
 class Position:
-    """사업자+종목별 잔고 요약."""
+    """사업자+종목+증권사(계좌)별 잔고 요약."""
 
     business_id: int
     business_name: str
@@ -190,6 +234,8 @@ class Position:
     total_cost: float
     realized_pnl: float
     lots: list[Lot] = field(default_factory=list)
+    account_id: int | None = None
+    account_name: str = ""
 
 
 @dataclass

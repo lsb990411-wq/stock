@@ -19,14 +19,14 @@ class MiraeAssetParser(BrokerParser):
     name = "미래에셋증권"
     aliases = ["미래에셋", "mirae", "miraeasset", "주식주문체결"]
 
-    DATE_CANDS = ["거래일", "체결일자", "주문일자", "매매일자", "일자", "기준일"]
+    DATE_CANDS = ["결제일자", "거래일자", "거래일", "체결일자", "주문일자", "매매일자", "일자", "기준일"]
     CODE_CANDS = ["종목코드", "종목번호", "단축코드", "종목CD", "코드"]
     NAME_CANDS = ["종목명", "종목", "종목이름"]
-    SIDE_CANDS = ["매매구분", "거래구분", "주문구분", "매수매도구분", "구분"]
-    QTY_CANDS = ["체결수량", "수량", "거래수량", "주문수량"]
-    PRICE_CANDS = ["체결단가", "체결가", "단가", "매매단가", "평균단가"]
+    SIDE_CANDS = ["거래유형", "매매구분", "거래구분", "주문구분", "매수매도구분", "구분"]
+    QTY_CANDS = ["수량", "체결수량", "거래수량", "주문수량"]
+    PRICE_CANDS = ["단가", "체결단가", "체결가", "매매단가", "평균단가"]
     FEE_CANDS = ["수수료", "위탁수수료"]
-    TAX_CANDS = ["거래세", "농특세", "제세금", "세금"]
+    TAX_CANDS = ["제세금", "거래세", "농특세", "세금"]
     AMT_CANDS = ["정산금액", "결제금액", "거래대금", "체결금액", "거래금액"]
     ACCT_CANDS = ["계좌번호", "계좌명", "계좌"]
 
@@ -49,6 +49,8 @@ class MiraeAssetParser(BrokerParser):
         headers = " ".join(str(c) for c in df.columns)
         if "위탁수수료" in headers or "농특세" in headers or "거래대금" in headers:
             score += 0.15
+        if "결제일자" in headers:
+            score += 0.2
         return min(score, 1.0)
 
     def parse(self, df: pd.DataFrame, *, default_business: str) -> BrokerParseResult:

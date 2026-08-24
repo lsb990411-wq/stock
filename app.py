@@ -24,28 +24,45 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.brokers import detect_and_parse, list_brokers
 from src.brokers.pdf_parser import OCR_TIP, empty_trade_rows
-from src.fifo import compute_positions
 from src.legacy_journal import parse_legacy_journal_excel
 
 # Streamlit 핫리로드 시 stale sys.modules 방지
 import importlib
 
+import src.brokers as _brokers_mod
+import src.brokers.detector as _brokers_detector_mod
+import src.brokers.identify as _brokers_identify_mod
+import src.brokers.kb_overseas as _kb_overseas_mod
+import src.brokers.meritz_overseas as _meritz_overseas_mod
+import src.brokers.mirae_overseas as _mirae_overseas_mod
 import src.models as _models_mod
 import src.storage as _storage_mod
+import src.fifo as _fifo_mod
 import src.voucher_export as _voucher_mod
 import src.income_parser as _income_parser_mod
 import src.income_voucher as _income_voucher_mod
 import src.import_export as _import_export_mod
 
+# 하위 모듈부터 리로드 (detector가 kb/meritz를 참조)
+_brokers_identify_mod = importlib.reload(_brokers_identify_mod)
+_kb_overseas_mod = importlib.reload(_kb_overseas_mod)
+_meritz_overseas_mod = importlib.reload(_meritz_overseas_mod)
+_mirae_overseas_mod = importlib.reload(_mirae_overseas_mod)
+_brokers_detector_mod = importlib.reload(_brokers_detector_mod)
+_brokers_mod = importlib.reload(_brokers_mod)
 _models_mod = importlib.reload(_models_mod)
 _storage_mod = importlib.reload(_storage_mod)
+_fifo_mod = importlib.reload(_fifo_mod)
 _voucher_mod = importlib.reload(_voucher_mod)
 _income_parser_mod = importlib.reload(_income_parser_mod)
 _income_voucher_mod = importlib.reload(_income_voucher_mod)
 _import_export_mod = importlib.reload(_import_export_mod)
 
+detect_and_parse = _brokers_mod.detect_and_parse
+detect_and_parse_overseas = _brokers_mod.detect_and_parse_overseas
+list_brokers = _brokers_mod.list_brokers
+parse_overseas_with_hint = _brokers_mod.parse_overseas_with_hint
 AccountConfig = _models_mod.AccountConfig
 IncomeAccountConfig = _models_mod.IncomeAccountConfig
 Trade = _models_mod.Trade
@@ -54,21 +71,29 @@ MARKET_OVERSEAS = _models_mod.MARKET_OVERSEAS
 FX_CURRENCIES = _models_mod.FX_CURRENCIES
 normalize_market = _models_mod.normalize_market
 normalize_currency = _models_mod.normalize_currency
+normalize_side = _models_mod.normalize_side
+coerce_fx_rate = _models_mod.coerce_fx_rate
 now_str = _models_mod.now_str
 Storage = _storage_mod.Storage
+compute_positions = _fifo_mod.compute_positions
+sells_by_trade_id = _fifo_mod.sells_by_trade_id
+aggregate_positions_by_stock = _fifo_mod.aggregate_positions_by_stock
+buy_lot_remainders = _fifo_mod.buy_lot_remainders
 export_voucher_excel_bytes = _voucher_mod.export_voucher_excel_bytes
 trades_to_voucher_lines = _voucher_mod.trades_to_voucher_lines
 parse_income_file = _income_parser_mod.parse_income_file
 rows_to_dataframe = _income_parser_mod.rows_to_dataframe
+apply_income_fx_rates = _income_parser_mod.apply_income_fx_rates
+ensure_income_preview_columns = _income_parser_mod.ensure_income_preview_columns
 export_income_voucher_excel_bytes = _income_voucher_mod.export_income_voucher_excel_bytes
 income_to_voucher_lines = _income_voucher_mod.income_to_voucher_lines
 dataframe_to_trades = _import_export_mod.dataframe_to_trades
 export_to_csv_bytes = _import_export_mod.export_to_csv_bytes
 export_to_excel_bytes = _import_export_mod.export_to_excel_bytes
-import_standard_file = _import_export_mod.import_standard_file
 positions_to_dataframe = _import_export_mod.positions_to_dataframe
 sell_results_to_dataframe = _import_export_mod.sell_results_to_dataframe
 trades_to_dataframe = _import_export_mod.trades_to_dataframe
+broker_name_from_source = _import_export_mod.broker_name_from_source
 
 st.set_page_config(
     page_title="법인 주식 매매일지",
@@ -160,7 +185,7 @@ def inject_sidebar_styles() -> None:
     st.markdown(SIDEBAR_CUSTOM_CSS, unsafe_allow_html=True)
 
 
-STORAGE_CACHE_VERSION = 18  # Storage API 변경 시 증가 → 캐시 무효화
+STORAGE_CACHE_VERSION = 28  # Storage API 변경 시 증가 → 캐시 무효화
 
 
 @st.cache_resource
@@ -170,14 +195,20 @@ def _storage_singleton(_version: int) -> object:
 
     import src.models as models_mod
     import src.storage as storage_mod
+    import src.supabase_client as supabase_mod
 
     importlib.reload(models_mod)
+    importlib.reload(supabase_mod)
+    try:
+        supabase_mod.reset_supabase_client()
+    except Exception:  # noqa: BLE001
+        pass
     storage_mod = importlib.reload(storage_mod)
     return storage_mod.Storage()
 
 
 def get_storage() -> Storage:
-    """SQLite Storage. 핫리로드로 모델/메서드가 어긋나면 강제 갱신한다."""
+    """Supabase Storage. 핫리로드로 모델/메서드가 어긋나면 강제 갱신한다."""
     import importlib
     import inspect
     import types
@@ -188,9 +219,14 @@ def get_storage() -> Storage:
     storage = _storage_singleton(STORAGE_CACHE_VERSION)
     required = (
         "update_trade_date",
+        "update_trade_disposal_pnl",
         "get_all_stocks",
         "get_all_accounts",
         "delete_account",
+        "get_or_create_account",
+        "get_account_by_name",
+        "list_accounts",
+        "add_account",
         "get_trades_by_period",
         "get_account_config",
         "save_account_config",
@@ -201,6 +237,7 @@ def get_storage() -> Storage:
         "get_income_records_by_period",
         "list_broker_partners",
         "clear_trades_for_business",
+        "clear_income_records_for_business",
     )
     biz_ok = True
     stocks_ok = False
@@ -264,8 +301,34 @@ def trade_table_column_config() -> dict:
         "수수료": st.column_config.NumberColumn("수수료", format="%,d 원"),
         "제세금": st.column_config.NumberColumn("제세금", format="%,d 원"),
         "정산금액": st.column_config.NumberColumn("정산금액", format="%,d 원"),
+        "처분손익": st.column_config.NumberColumn("처분손익", format="%,d 원"),
         "ID": st.column_config.NumberColumn("ID", format="%d"),
     }
+
+
+def _attach_disposal_pnl(df: pd.DataFrame, sells) -> pd.DataFrame:
+    """매도 행에 FIFO 처분손익(전표와 동일 산식)을 붙인다."""
+    if df is None or df.empty or "ID" not in df.columns:
+        return df
+    by_id = sells_by_trade_id(sells)
+    values: list[float | None] = []
+    for tid in df["ID"]:
+        try:
+            if tid is None or (isinstance(tid, float) and pd.isna(tid)):
+                values.append(None)
+                continue
+            sell = by_id.get(int(tid))
+            if sell is None:
+                values.append(None)
+            else:
+                values.append(
+                    round(float(getattr(sell, "disposal_pnl", sell.realized_pnl) or 0), 0)
+                )
+        except (TypeError, ValueError):
+            values.append(None)
+    out = df.copy()
+    out["처분손익"] = values
+    return out
 
 
 def _filter_stock_trades(
@@ -273,15 +336,28 @@ def _filter_stock_trades(
     *,
     stock_name: str,
     business_name: str = "",
+    stock_code: str = "",
 ) -> pd.DataFrame:
     trades_df = trades_to_dataframe(trades)
     if trades_df.empty:
         return trades_df
     detail = trades_df.copy()
-    if "종목명" in detail.columns:
-        detail = detail[detail["종목명"].astype(str) == stock_name]
+    name = (stock_name or "").strip()
+    code = (stock_code or "").strip().upper()
+    if "종목명" in detail.columns and name:
+        names = detail["종목명"].astype(str).str.strip()
+        mask = (names == name) | (names.str.upper() == name.upper())
+        if code and "종목코드" in detail.columns:
+            codes = detail["종목코드"].astype(str).str.strip().str.upper()
+            mask = mask | (codes == code)
+        detail = detail[mask]
+    elif code and "종목코드" in detail.columns:
+        codes = detail["종목코드"].astype(str).str.strip().str.upper()
+        detail = detail[codes == code]
     if business_name and "사업자" in detail.columns:
-        detail = detail[detail["사업자"].astype(str) == business_name]
+        biz = business_name.strip()
+        biz_col = detail["사업자"].astype(str).str.strip()
+        detail = detail[biz_col == biz]
     detail = detail.drop(columns=["출처"], errors="ignore")
     # 핫리로드 stale 모듈 대비: 원가 컬럼 없으면 수량×단가로 즉시 생성
     if "거래금액(원가)" not in detail.columns and {"수량", "단가"}.issubset(detail.columns):
@@ -289,7 +365,7 @@ def _filter_stock_trades(
             pd.to_numeric(detail["수량"], errors="coerce").fillna(0)
             * pd.to_numeric(detail["단가"], errors="coerce").fillna(0)
         )
-    for col in ("수량", "거래금액(원가)", "단가", "수수료", "제세금", "정산금액", "ID"):
+    for col in ("수량", "거래금액(원가)", "단가", "수수료", "제세금", "정산금액", "처분손익", "ID"):
         if col in detail.columns:
             detail[col] = pd.to_numeric(detail[col], errors="coerce")
 
@@ -352,13 +428,113 @@ DETAIL_TRADE_COLUMNS = [
     "종목명",
     "거래유형",
     "수량",
-    "거래금액(원가)",
+    "잔여수량",
+    "매수단가(외화)",
+    "매수단가(원화)",
+    "거래금액(외화)",
+    "거래금액(원화)",
     "단가",
     "수수료",
     "제세금",
     "정산금액",
+    "처분손익",
     "메모",
 ]
+
+
+def _attach_fifo_remainders(df: pd.DataFrame, trades: list) -> pd.DataFrame:
+    """매수 행에 FIFO 잔여수량·매수단가(외화/원화) 컬럼을 붙인다.
+
+    매도·배당 행은 매수단가 컬럼을 None으로 둔다.
+    """
+    if df is None or df.empty or "ID" not in df.columns:
+        return df
+    rem_map = buy_lot_remainders(trades)
+    out = df.copy()
+    rem_qty: list[float | None] = []
+    buy_fx: list[float | None] = []
+    buy_krw: list[float | None] = []
+    for _, row in out.iterrows():
+        side = str(row.get("거래유형") or "")
+        try:
+            tid = int(row["ID"]) if pd.notna(row.get("ID")) else 0
+        except (TypeError, ValueError):
+            tid = 0
+        info = rem_map.get(tid)
+        if "매수" in side and info is not None:
+            rem_qty.append(round(float(info["remaining_qty"]), 4))
+            krw = float(info["buy_price"])
+            fx_px = float(info.get("buy_price_fx") or 0)
+            # FIFO 맵에 외화단가가 없으면 행의 외화단가/환율로 보완
+            if fx_px <= 0:
+                fx_px = float(pd.to_numeric(row.get("외화단가"), errors="coerce") or 0)
+            if fx_px <= 0:
+                rate = float(pd.to_numeric(row.get("환율"), errors="coerce") or 0)
+                if rate > 0 and krw > 0:
+                    fx_px = krw / rate
+            buy_fx.append(round(fx_px, 6) if fx_px > 0 else None)
+            buy_krw.append(round(krw, 4) if krw > 0 else None)
+        else:
+            rem_qty.append(None)
+            buy_fx.append(None)
+            buy_krw.append(None)
+    out["잔여수량"] = rem_qty
+    out["매수단가(외화)"] = buy_fx
+    out["매수단가(원화)"] = buy_krw
+    out.drop(columns=["매수단가"], errors="ignore", inplace=True)
+    return out
+
+
+def _attach_trade_amounts(df: pd.DataFrame) -> pd.DataFrame:
+    """거래금액(외화/원화) 컬럼 부착.
+
+    - 거래금액(외화) = 수량 × 외화단가 (표시: '1,234.5600 USD')
+    - 거래금액(원화) = 수량 × 외화단가 × 환율 (수수료 제외)
+      외화단가·환율이 없으면 수량 × 원화단가
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    disp_fx: list[str | None] = []
+    amt_krw: list[float | None] = []
+
+    for _, row in out.iterrows():
+        qty = float(pd.to_numeric(row.get("수량"), errors="coerce") or 0)
+        price_fx = float(pd.to_numeric(row.get("외화단가"), errors="coerce") or 0)
+        fx_rate = float(pd.to_numeric(row.get("환율"), errors="coerce") or 0)
+        price_krw = float(pd.to_numeric(row.get("단가"), errors="coerce") or 0)
+        ccy = str(row.get("통화") or "").strip().upper() or "USD"
+        side = str(row.get("거래유형") or "")
+
+        if qty <= 0 and "배당" not in side:
+            disp_fx.append(None)
+            amt_krw.append(None)
+            continue
+
+        if price_fx > 0:
+            fx_amt = qty * price_fx
+            disp_fx.append(f"{fx_amt:,.4f} {ccy}")
+            if fx_rate > 0:
+                amt_krw.append(round(qty * price_fx * fx_rate, 0))
+            elif price_krw > 0:
+                amt_krw.append(round(qty * price_krw, 0))
+            else:
+                amt_krw.append(None)
+        else:
+            # 국내주식 등 외화 없음
+            disp_fx.append(None)
+            if price_krw > 0 and qty > 0:
+                amt_krw.append(round(qty * price_krw, 0))
+            elif "거래금액(원가)" in out.columns:
+                legacy = float(pd.to_numeric(row.get("거래금액(원가)"), errors="coerce") or 0)
+                amt_krw.append(round(legacy, 0) if legacy else None)
+            else:
+                amt_krw.append(None)
+
+    out["거래금액(외화)"] = disp_fx
+    out["거래금액(원화)"] = amt_krw
+    return out
+
 
 
 def _normalize_trade_date(value) -> str | None:
@@ -384,6 +560,138 @@ def _normalize_trade_date(value) -> str | None:
 def _dismiss_stock_detail_modal() -> None:
     """종목 상세 다이얼로그 닫힘 시 pending 제거 (query clear 후 rerun에서도 유지하다가 해제)."""
     st.session_state.pop("_pending_stock_detail", None)
+    st.session_state.pop("_stock_detail_pnl_toast", None)
+    st.session_state.pop("_pnl_editor_dirty", None)
+    # 처분손익 에디터/기준선 세션 잔여 정리 (위젯 키는 버전으로 무효화)
+    for key in list(st.session_state.keys()):
+        sk = str(key)
+        if (
+            sk.startswith("stock_detail_pnl_editor_")
+            or sk.startswith("_pnl_baseline_")
+            or sk.startswith("_pnl_input_snap_")
+        ):
+            try:
+                del st.session_state[key]
+            except Exception:  # noqa: BLE001
+                st.session_state.pop(key, None)
+
+
+def _is_sell_side_label(side: object) -> bool:
+    text = str(side or "").strip()
+    return ("매도" in text) and ("배당" not in text)
+
+
+def _parse_pnl_cell(raw) -> float | None:
+    """data_editor 처분손익 셀 → float | None."""
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        return None
+    if isinstance(raw, str):
+        text = raw.strip().replace(",", "").replace("원", "").replace(" ", "")
+        if not text or text.lower() in {"none", "null", "nan", "-"}:
+            return None
+        try:
+            return round(float(text), 0)
+        except ValueError:
+            return None
+    try:
+        if pd.isna(raw):
+            return None
+        return round(float(raw), 0)
+    except (TypeError, ValueError):
+        return None
+
+
+def _pnl_values_differ(a: float | None, b: float | None) -> bool:
+    if a is None and b is None:
+        return False
+    if a is None or b is None:
+        return True
+    return abs(float(a) - float(b)) >= 0.5
+
+
+def _collect_disposal_pnl_updates(
+    *,
+    edited_df: pd.DataFrame,
+    input_df: pd.DataFrame,
+    widget_state: object,
+    stored_override: dict[int, float | None],
+) -> dict[int, float | None]:
+    """에디터 반환 DF · edited_rows · 입력 스냅샷을 ID 기준으로 비교해 저장 대상 추출."""
+    updates: dict[int, float | None] = {}
+
+    # 입력 DF 기준: 행 위치 → trade id, 매도 여부, 표시 기준값
+    id_by_pos: dict[int, int] = {}
+    sell_ids: set[int] = set()
+    input_pnl: dict[int, float | None] = {}
+    for pos, (_, row) in enumerate(input_df.iterrows()):
+        if pd.isna(row.get("ID")):
+            continue
+        tid = int(row["ID"])
+        id_by_pos[pos] = tid
+        if _is_sell_side_label(row.get("거래유형")):
+            sell_ids.add(tid)
+            input_pnl[tid] = _parse_pnl_cell(row.get("처분손익"))
+
+    def _baseline(tid: int) -> float | None:
+        # DB 오버라이드가 있으면 그것과 비교, 없으면 화면에 보여준 입력값
+        if tid in stored_override and stored_override[tid] is not None:
+            return stored_override[tid]
+        return input_pnl.get(tid)
+
+    def _queue(tid: int, new_val: float | None) -> None:
+        if tid not in sell_ids:
+            return
+        stored = stored_override.get(tid)
+        base = _baseline(tid)
+        if new_val is None:
+            # 비움 → DB 오버라이드가 있을 때만 NULL로 복귀
+            if stored is not None:
+                updates[tid] = None
+            return
+        if _pnl_values_differ(new_val, base):
+            updates[tid] = new_val
+
+    # 1) session_state EditingState.edited_rows (행 위치 → 컬럼)
+    edited_rows: dict = {}
+    if isinstance(widget_state, dict):
+        raw_rows = widget_state.get("edited_rows") or {}
+        if isinstance(raw_rows, dict):
+            edited_rows = raw_rows
+    for pos_key, changes in edited_rows.items():
+        try:
+            pos = int(pos_key)
+        except (TypeError, ValueError):
+            continue
+        tid = id_by_pos.get(pos)
+        if tid is None or not isinstance(changes, dict):
+            continue
+        if "처분손익" not in changes:
+            continue
+        _queue(tid, _parse_pnl_cell(changes.get("처분손익")))
+
+    # 2) 반환 DataFrame — ID 컬럼으로 직접 매핑 (정렬/필터와 무관)
+    if edited_df is not None and not edited_df.empty and "ID" in edited_df.columns:
+        for _, row in edited_df.iterrows():
+            if pd.isna(row.get("ID")):
+                continue
+            tid = int(row["ID"])
+            if tid not in sell_ids:
+                continue
+            _queue(tid, _parse_pnl_cell(row.get("처분손익")))
+
+    return updates
+
+
+def _save_disposal_pnl_updates(updates: dict[int, float | None]) -> int:
+    """Supabase trades.disposal_pnl 업데이트. 성공 건수 반환."""
+    if not updates:
+        return 0
+    db = get_storage()
+    saved = 0
+    for tid, new_val in updates.items():
+        db.update_trade_disposal_pnl(int(tid), new_val)
+        saved += 1
+    return saved
 
 
 def _highlight_trade_type(val) -> str:
@@ -398,6 +706,313 @@ def _highlight_trade_type(val) -> str:
     return ""
 
 
+def _stock_detail_holding_metrics(
+    df: pd.DataFrame,
+    *,
+    positions: list | None = None,
+    stock_name: str = "",
+    business_name: str = "",
+    stock_code: str = "",
+) -> dict[str, float | str]:
+    """종목 상세용 보유·평가 요약.
+
+    - 보유수량/평단/원가: FIFO 포지션 우선, 없으면 매수−매도·원가합으로 추정
+    - 평가단가: 최근 거래 원화 단가 (없으면 외화단가×환율)
+    - 평가금액 = 보유수량 × 평가단가
+    - 평가손익 = 평가금액 − 원가잔액
+    """
+    qty = 0.0
+    avg_cost = 0.0
+    book_cost = 0.0
+    realized = 0.0
+    mark_price = 0.0
+    mark_note = "최근 거래단가"
+
+    name = (stock_name or "").strip()
+    code = (stock_code or "").strip().upper()
+    biz = (business_name or "").strip()
+
+    matched_pos = []
+    if positions:
+        for p in positions:
+            pname = str(getattr(p, "stock_name", "") or "").strip()
+            pcode = str(getattr(p, "stock_code", "") or "").strip().upper()
+            pbiz = str(getattr(p, "business_name", "") or "").strip()
+            if biz and pbiz != biz:
+                continue
+            name_ok = bool(name) and (
+                pname == name or pname.upper() == name.upper()
+            )
+            code_ok = bool(code) and pcode == code
+            if name_ok or code_ok:
+                matched_pos.append(p)
+            elif not name and not code:
+                continue
+
+    if matched_pos:
+        qty = float(sum(float(p.quantity or 0) for p in matched_pos))
+        book_cost = float(sum(float(p.total_cost or 0) for p in matched_pos))
+        realized = float(sum(float(p.realized_pnl or 0) for p in matched_pos))
+        avg_cost = (book_cost / qty) if qty > 1e-12 else 0.0
+    elif df is not None and not df.empty:
+        work = df.copy()
+        side = work["거래유형"].astype(str) if "거래유형" in work.columns else None
+        qty_s = pd.to_numeric(work.get("수량"), errors="coerce").fillna(0.0)
+        if side is not None:
+            buy_m = side.str.contains("매수|매입|입고", regex=True, na=False)
+            sell_m = side.str.contains("매도", na=False) & ~side.str.contains("배당", na=False)
+            qty = float(qty_s[buy_m].sum() - qty_s[sell_m].sum())
+            # 단순 원가: 매수 거래금액 합 − 매도 수량에 대응하는 추정은 생략, 매수 원가합만
+            if "거래금액(원가)" in work.columns:
+                cost_s = pd.to_numeric(work["거래금액(원가)"], errors="coerce").fillna(0.0)
+            else:
+                price_s = pd.to_numeric(work.get("단가"), errors="coerce").fillna(0.0)
+                cost_s = qty_s * price_s
+            buy_cost = float(cost_s[buy_m].sum())
+            buy_qty = float(qty_s[buy_m].sum())
+            # 잔여 원가는 매수원가 × (잔여/매수수량) 근사
+            if buy_qty > 1e-12 and qty > 1e-12:
+                book_cost = buy_cost * (qty / buy_qty)
+                avg_cost = book_cost / qty
+            elif qty > 1e-12 and buy_qty > 1e-12:
+                avg_cost = buy_cost / buy_qty
+                book_cost = avg_cost * qty
+
+    # 평가단가: 시간순 마지막 유효 단가
+    if df is not None and not df.empty:
+        ordered = _sort_trades_chronologically(df)
+        for i in range(len(ordered) - 1, -1, -1):
+            row = ordered.iloc[i]
+            side_t = str(row.get("거래유형") or "")
+            if "배당" in side_t:
+                continue
+            px = float(pd.to_numeric(row.get("단가"), errors="coerce") or 0)
+            if px > 0:
+                mark_price = px
+                mark_note = "최근 거래 원화단가"
+                break
+            fx_px = float(pd.to_numeric(row.get("외화단가"), errors="coerce") or 0)
+            fx = float(pd.to_numeric(row.get("환율"), errors="coerce") or 0)
+            if fx_px > 0 and fx > 0:
+                mark_price = fx_px * fx
+                mark_note = "최근 외화단가×환율"
+                break
+
+    if mark_price <= 0 and avg_cost > 0:
+        mark_price = avg_cost
+        mark_note = "평균단가(최근가 없음)"
+
+    qty = max(qty, 0.0) if qty > -1e-9 else qty
+    market_value = qty * mark_price if qty > 1e-12 else 0.0
+    unrealized = market_value - book_cost if qty > 1e-12 else 0.0
+
+    return {
+        "qty": float(qty),
+        "avg_cost": float(avg_cost),
+        "book_cost": float(book_cost),
+        "mark_price": float(mark_price),
+        "market_value": float(market_value),
+        "unrealized": float(unrealized),
+        "realized": float(realized),
+        "mark_note": mark_note,
+    }
+
+
+def _safe_download_filename_part(text: str, *, fallback: str = "미지정") -> str:
+    """파일명에 쓸 수 없는 문자 제거."""
+    raw = str(text or "").strip() or fallback
+    for ch in '\\/:*?"<>|\n\r\t':
+        raw = raw.replace(ch, "_")
+    raw = "_".join(p for p in raw.split() if p)
+    return raw[:80] or fallback
+
+
+def _dataframe_to_xlsx_bytes(df: pd.DataFrame, sheet_name: str = "거래내역") -> bytes:
+    """DataFrame → .xlsx bytes."""
+    import io
+
+    bio = io.BytesIO()
+    export = df.copy()
+    if "거래일자" in export.columns:
+        export["거래일자"] = export["거래일자"].astype(str)
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        export.to_excel(writer, sheet_name=sheet_name[:31] or "Sheet1", index=False)
+    return bio.getvalue()
+
+
+def _row_get(row: object, key: str, default=None):
+    try:
+        if hasattr(row, "get"):
+            return row.get(key, default)  # type: ignore[union-attr]
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return row[key]  # type: ignore[index]
+    except Exception:  # noqa: BLE001
+        return default
+
+
+def _fmt_qty_num(value: float) -> str:
+    """수량·단가 표시 (불필요 소수·과학적 표기 방지)."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "0"
+    x = float(value)
+    if abs(x - round(x)) < 1e-9:
+        return str(int(round(x)))
+    s = f"{x:.6f}".rstrip("0").rstrip(".")
+    return s or "0"
+
+
+def _trade_fx_fields(row: object) -> tuple[float, float, float, float, str]:
+    """수량, 외화단가, 환율, 원화단가, 통화."""
+    qty = float(pd.to_numeric(_row_get(row, "수량"), errors="coerce") or 0)
+    price_fx = float(pd.to_numeric(_row_get(row, "외화단가"), errors="coerce") or 0)
+    fx_rate = float(pd.to_numeric(_row_get(row, "환율"), errors="coerce") or 0)
+    price_krw = float(pd.to_numeric(_row_get(row, "단가"), errors="coerce") or 0)
+    ccy = str(_row_get(row, "통화") or "").strip().upper() or "KRW"
+    # 외화단가 누락 시 원화단가÷환율로 추정
+    if price_fx <= 0 and fx_rate > 0 and price_krw > 0 and ccy != "KRW":
+        price_fx = price_krw / fx_rate
+    return qty, price_fx, fx_rate, price_krw, ccy
+
+
+def _format_memo_stock_qty_fx(row: object) -> str:
+    """옵션1: 종목명 거래유형 / @수량주 * $단가 * 환율원
+
+    예: INVESCO NASDAQ 100 매수 / @40주 * $247.67 * 1442.00원
+    """
+    name = str(_row_get(row, "종목명") or "").strip() or str(
+        _row_get(row, "종목코드") or ""
+    ).strip()
+    side = str(_row_get(row, "거래유형") or "").strip() or "거래"
+    qty, price_fx, fx_rate, price_krw, ccy = _trade_fx_fields(row)
+
+    if qty <= 0:
+        return str(_row_get(row, "메모") or "").strip()
+
+    head = f"{name} {side}".strip()
+    if price_fx > 0 and fx_rate > 0 and ccy != "KRW":
+        if ccy == "USD":
+            px = f"${price_fx:.2f}"
+        else:
+            px = f"{ccy} {price_fx:.2f}"
+        return f"{head} / @{_fmt_qty_num(qty)}주 * {px} * {fx_rate:.2f}원"
+    if price_krw > 0:
+        return f"{head} / @{_fmt_qty_num(qty)}주 * {price_krw:,.0f}원"
+    return str(_row_get(row, "메모") or head).strip()
+
+
+def _format_memo_ccy_amount_qty(row: object) -> str:
+    """옵션2: 통화 외화총액 / 수량주*단가 * 환율
+
+    예: USD 1862.29 / 5주*371.529 * 1528.6
+    """
+    qty, price_fx, fx_rate, price_krw, ccy = _trade_fx_fields(row)
+
+    if price_fx > 0 and qty > 0 and ccy != "KRW":
+        fx_amt = qty * price_fx
+        body = (
+            f"{ccy} {_fmt_qty_num(fx_amt)} / "
+            f"{_fmt_qty_num(qty)}주*{_fmt_qty_num(price_fx)}"
+        )
+        if fx_rate > 0:
+            body += f" * {_fmt_qty_num(fx_rate)}"
+        return body
+    if price_krw > 0 and qty > 0:
+        return (
+            f"KRW {_fmt_qty_num(qty * price_krw)} / "
+            f"{_fmt_qty_num(qty)}주*{_fmt_qty_num(price_krw)}"
+        )
+    return str(_row_get(row, "메모") or "").strip()
+
+
+def _format_overseas_detail_memo(row: object) -> str:
+    """하위 호환: 옵션2와 동일."""
+    return _format_memo_ccy_amount_qty(row)
+
+
+def _pad_memo_strings(memos: list[str]) -> list[str]:
+    """옵션2 적요: '/' 기준 앞부분만 최장 길이에 맞춰 오른쪽 공백 패딩.
+
+    예)
+      USD 9906.8 / 40주*247.67 * 1442
+      USD 7021   / 100주*70.21 * 1442
+    → 앞부분(통화·금액) 정렬 후 재조합: 앞부분.ljust(max) + " / " + 뒷부분
+    """
+    cleaned = ["" if m is None else str(m) for m in memos]
+    if not cleaned:
+        return cleaned
+
+    fronts: list[str] = []
+    backs: list[str] = []
+    has_sep: list[bool] = []
+    for m in cleaned:
+        if "/" in m:
+            left, right = m.split("/", 1)
+            fronts.append(left.rstrip())
+            backs.append(right.lstrip())
+            has_sep.append(True)
+        else:
+            fronts.append(m)
+            backs.append("")
+            has_sep.append(False)
+
+    # '/' 가 있는 행들만 앞부분 길이 기준으로 패딩
+    sep_front_lens = [len(f) for f, sep in zip(fronts, has_sep) if sep]
+    if not sep_front_lens:
+        return cleaned
+    max_len = max(sep_front_lens)
+
+    out: list[str] = []
+    for front, back, sep in zip(fronts, backs, has_sep):
+        if not sep:
+            out.append(front)
+            continue
+        out.append(front.ljust(max_len) + " / " + back)
+    return out
+
+
+def _prepare_stock_detail_export(
+    df: pd.DataFrame,
+    *,
+    memo_mode: str,
+    display_cols: list[str],
+) -> pd.DataFrame:
+    """엑셀 다운로드용 DF (종목 상세). memo_mode: 'as_is' | 'stock' | 'amount'."""
+    if df is None or df.empty:
+        return df
+    export = df.copy()
+    keep = list(dict.fromkeys([*display_cols, "통화", "환율", "외화단가", "메모", "ID"]))
+    cols = [c for c in keep if c in export.columns]
+    export = export.loc[:, cols].copy()
+
+    if memo_mode == "stock":
+        raw = [_format_memo_stock_qty_fx(row) for _, row in export.iterrows()]
+        export["적요"] = raw
+    elif memo_mode == "amount":
+        raw = [_format_memo_ccy_amount_qty(row) for _, row in export.iterrows()]
+        export["적요"] = _pad_memo_strings(raw)
+    else:
+        export["적요"] = export["메모"] if "메모" in export.columns else ""
+
+    out_cols = []
+    for c in display_cols:
+        if c == "메모":
+            out_cols.append("적요")
+        elif c in export.columns and c != "적요":
+            out_cols.append(c)
+    if "적요" not in out_cols:
+        out_cols.append("적요")
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for c in out_cols:
+        if c not in seen and c in export.columns:
+            seen.add(c)
+            ordered.append(c)
+    return export.loc[:, ordered]
+
+
+
 @st.dialog(
     "📊 종목 상세 거래 내역",
     width="large",
@@ -408,23 +1023,42 @@ def show_stock_detail_modal(
     stock_name: str,
     df_stock_trades: pd.DataFrame,
     business_name: str = "",
+    positions: list | None = None,
+    stock_code: str = "",
+    all_trades: list | None = None,
 ) -> None:
     st.markdown(f"**종목명:** {stock_name}")
     if business_name:
         st.caption(f"사업자: {business_name}")
+    period = st.session_state.get("_dash_period") or {}
+    if period.get("start") and period.get("end"):
+        st.caption(
+            f"대시보드 조회 기간: **{period['start']} ~ {period['end']}** "
+            "(표는 기간 내 거래, 잔여수량·보유요약은 종료일 기준 FIFO)"
+        )
 
     if df_stock_trades is None or df_stock_trades.empty:
         st.info("해당 종목의 거래 내역이 없습니다.")
         return
 
     if "ID" not in df_stock_trades.columns:
-        st.error("거래 ID가 없어 일자를 수정할 수 없습니다.")
+        st.error("거래 ID가 없어 처분손익·일자를 수정할 수 없습니다.")
         return
 
-    display_cols = [c for c in DETAIL_TRADE_COLUMNS if c in df_stock_trades.columns]
+    pending_toast = st.session_state.pop("_stock_detail_pnl_toast", None)
+    if pending_toast:
+        st.toast(str(pending_toast))
+
+    # FIFO 매수 잔여·매수단가 + 거래금액(외화/원화)
+    fifo_src = all_trades if all_trades is not None else []
+    enriched = _attach_trade_amounts(_attach_fifo_remainders(df_stock_trades, fifo_src))
+
+    display_cols = [c for c in DETAIL_TRADE_COLUMNS if c in enriched.columns]
     # 팝업 표시 직전 시간순 재정렬
-    sorted_src = _sort_trades_chronologically(df_stock_trades)
-    work = sorted_src.loc[:, [c for c in [*display_cols, "ID"] if c in sorted_src.columns]].copy()
+    sorted_src = _sort_trades_chronologically(enriched)
+    work = sorted_src.loc[
+        :, [c for c in [*display_cols, "ID"] if c in sorted_src.columns]
+    ].copy()
     work["거래일자"] = pd.to_datetime(work["거래일자"], errors="coerce").dt.date
     work["ID"] = pd.to_numeric(work["ID"], errors="coerce").astype("Int64")
     original_dates = {
@@ -433,35 +1067,228 @@ def show_stock_detail_modal(
         if pd.notna(tid)
     }
 
-    # 조회용 표: 매수(빨강) / 매도(파랑) / 배당(초록)
+    # 처분손익 기준값 (매도만 숫자, 그 외 None)
+    original_pnl: dict[int, float | None] = {}
+    for _, row in work.iterrows():
+        if pd.isna(row.get("ID")):
+            continue
+        tid = int(row["ID"])
+        side = str(row.get("거래유형") or "")
+        raw = row.get("처분손익") if "처분손익" in work.columns else None
+        if side != "매도":
+            original_pnl[tid] = None
+            if "처분손익" in work.columns:
+                work.at[row.name, "처분손익"] = None
+        elif raw is None or (isinstance(raw, float) and pd.isna(raw)):
+            original_pnl[tid] = None
+        else:
+            try:
+                original_pnl[tid] = float(raw)
+            except (TypeError, ValueError):
+                original_pnl[tid] = None
+
+    # 상단 요약: 처분손익 합(누적실현)이 표와 동기화되도록 work 기준
+    metrics = _stock_detail_holding_metrics(
+        work,
+        positions=positions,
+        stock_name=stock_name,
+        business_name=business_name,
+        stock_code=stock_code,
+    )
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("보유수량", f"{metrics['qty']:,.4f} 주")
+    m2.metric("평균단가", f"{metrics['avg_cost']:,.0f} 원")
+    m3.metric(
+        "평가금액",
+        f"{metrics['market_value']:,.0f} 원",
+        help=f"보유수량 × 평가단가({metrics['mark_note']}: {metrics['mark_price']:,.0f} 원)",
+    )
+    unreal = float(metrics["unrealized"])
+    m4.metric(
+        "평가손익",
+        f"{unreal:,.0f} 원",
+        delta=f"{unreal:,.0f}",
+        delta_color="normal",
+        help="평가금액 − 원가잔액 (시세 연동 없음 · 최근 거래단가 기준)",
+    )
+    st.caption(
+        f"원가잔액 {metrics['book_cost']:,.0f} 원 · "
+        f"평가단가 {metrics['mark_price']:,.0f} 원 ({metrics['mark_note']})"
+        + (
+            f" · 누적실현손익 {metrics['realized']:,.0f} 원"
+            if abs(float(metrics["realized"])) > 1e-9
+            else ""
+        )
+    )
+
     view = work.loc[:, [c for c in display_cols if c in work.columns]].copy()
     detail_col_config = {
         "거래일자": st.column_config.DateColumn("거래일자", format="YYYY-MM-DD"),
-        "수량": st.column_config.NumberColumn("수량", format="%,d"),
-        "거래금액(원가)": st.column_config.NumberColumn(
-            "거래금액(원가)", format="%,d 원", help="수량 × 단가"
+        "수량": st.column_config.NumberColumn("수량", format="%,.4f"),
+        "잔여수량": st.column_config.NumberColumn(
+            "잔여수량",
+            format="%,.4f",
+            help="해당 매수 건이 FIFO 매도 소진 후 남은 수량 (매도·배당 행은 비움, 전량 소진=0)",
+        ),
+        "매수단가(외화)": st.column_config.NumberColumn(
+            "매수단가(외화)",
+            format="%.4f",
+            help="매수 건의 외화 단가 (USD 등). 국내주식·매도 행은 비움",
+        ),
+        "매수단가(원화)": st.column_config.NumberColumn(
+            "매수단가(원화)",
+            format="%,d 원",
+            help="매수 건의 원화 환산 단가 (외화단가×환율). 매도·배당 행은 비움",
+        ),
+        "거래금액(외화)": st.column_config.TextColumn(
+            "거래금액(외화)",
+            help="수량 × 외화단가 (통화코드 포함, 수수료 제외)",
+        ),
+        "거래금액(원화)": st.column_config.NumberColumn(
+            "거래금액(원화)",
+            format="%,d 원",
+            help="수량 × 외화단가 × 적용환율 (수수료 제외). 외화 없으면 수량×원화단가",
         ),
         "단가": st.column_config.NumberColumn("단가", format="%,d 원"),
         "수수료": st.column_config.NumberColumn("수수료", format="%,d 원"),
         "제세금": st.column_config.NumberColumn("제세금", format="%,d 원"),
         "정산금액": st.column_config.NumberColumn("정산금액", format="%,d 원"),
+        "처분손익": st.column_config.NumberColumn(
+            "처분손익",
+            format="%,d 원",
+            help="매도 행만 수정 · 변경 시 즉시 저장 (비우면 FIFO 계산값으로 복귀)",
+            step=1,
+        ),
     }
-    if "거래유형" in view.columns:
-        styled_df = view.style.map(_highlight_trade_type, subset=["거래유형"])
-    else:
-        styled_df = view
-    st.dataframe(
-        styled_df,
+
+    stock_part = _safe_download_filename_part(stock_name, fallback="종목")
+    biz_part = _safe_download_filename_part(business_name or "전체", fallback="전체")
+    xlsx_name = f"{stock_part}_{biz_part}_거래내역.xlsx"
+    try:
+        xlsx_bytes = _dataframe_to_xlsx_bytes(view, sheet_name="거래내역")
+    except Exception as exc:  # noqa: BLE001
+        xlsx_bytes = b""
+        st.caption(f"엑셀 변환 실패: {exc}")
+
+    dl_col, _ = st.columns([1, 3])
+    with dl_col:
+        st.download_button(
+            "📥 엑셀 다운로드",
+            data=xlsx_bytes,
+            file_name=xlsx_name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="secondary",
+            use_container_width=True,
+            disabled=not xlsx_bytes,
+            key=f"stock_detail_xlsx_{biz_part}_{stock_part}",
+        )
+
+    st.caption(
+        "매수 행의 **잔여수량**·**매수단가**는 FIFO 기준입니다. "
+        "**처분손익**은 매도 행에서 수정 후 Enter/포커스 아웃 시 자동 저장됩니다. "
+        "자동 저장이 안 되면 아래 **처분손익 저장** 버튼을 눌러 주세요."
+    )
+
+    editor_df = view.copy()
+    if "ID" in work.columns and "ID" not in editor_df.columns:
+        editor_df["ID"] = work["ID"].values
+
+    # 행 위치 ↔ ID 매핑이 어긋나지 않도록 연속 RangeIndex 로 고정
+    editor_df = editor_df.reset_index(drop=True)
+    if "ID" not in editor_df.columns:
+        st.error("거래 ID 컬럼이 없어 처분손익을 저장할 수 없습니다.")
+        return
+    editor_df["ID"] = pd.to_numeric(editor_df["ID"], errors="coerce").astype("Int64")
+
+    # DB 오버라이드 (None = FIFO). 키는 반드시 int(trade.id)
+    stored_override: dict[int, float | None] = {}
+    for t in fifo_src:
+        try:
+            if t.id is None or str(t.side).upper() != "SELL":
+                continue
+            ov = getattr(t, "disposal_pnl", None)
+            stored_override[int(t.id)] = None if ov is None else float(ov)
+        except (TypeError, ValueError):
+            continue
+
+    editor_ver = int(st.session_state.get("_pnl_editor_ver", 0) or 0)
+    editor_key = f"stock_detail_pnl_editor_{biz_part}_{stock_part}_v{editor_ver}"
+    dirty_flag = "_pnl_editor_dirty"
+
+    def _mark_pnl_editor_dirty() -> None:
+        st.session_state[dirty_flag] = editor_key
+
+    # NumberColumn format에 '원'을 넣으면 일부 환경에서 커밋이 불안정할 수 있어 숫자만 표시
+    pnl_col_config = {
+        **{k: v for k, v in detail_col_config.items() if k in editor_df.columns},
+        "처분손익": st.column_config.NumberColumn(
+            "처분손익",
+            format="%,d",
+            help="매도 행만 수정 · Enter/포커스 아웃 시 저장 (비우면 FIFO 복귀)",
+            step=1,
+        ),
+        "ID": st.column_config.NumberColumn(
+            "ID",
+            format="%d",
+            disabled=True,
+            help="DB trades.id (저장 키)",
+            width="small",
+        ),
+    }
+    # ID를 앞에 두어 매핑 확인이 쉽도록
+    col_order = ["ID"] + [c for c in editor_df.columns if c != "ID"]
+    editor_df = editor_df.loc[:, col_order]
+
+    disabled_cols = [c for c in editor_df.columns if c != "처분손익"]
+    edited = st.data_editor(
+        editor_df,
         use_container_width=True,
         hide_index=True,
-        column_config=detail_col_config,
+        num_rows="fixed",
+        disabled=disabled_cols,
+        column_config=pnl_col_config,
+        column_order=col_order,
+        key=editor_key,
+        on_change=_mark_pnl_editor_dirty,
     )
+
+    widget_state = st.session_state.get(editor_key)
+    pending_updates = _collect_disposal_pnl_updates(
+        edited_df=edited if isinstance(edited, pd.DataFrame) else editor_df,
+        input_df=editor_df,
+        widget_state=widget_state,
+        stored_override=stored_override,
+    )
+
+    save_clicked = st.button(
+        "💾 처분손익 저장",
+        type="primary",
+        use_container_width=True,
+        key=f"stock_detail_pnl_save_{biz_part}_{stock_part}_v{editor_ver}",
+        help="표에서 처분손익을 수정한 뒤 이 버튼으로도 저장할 수 있습니다.",
+    )
+
+    # Enter/포커스 아웃(on_change·값 diff) 또는 저장 버튼 → 즉시 DB 반영
+    if pending_updates:
+        try:
+            saved = _save_disposal_pnl_updates(pending_updates)
+            if saved > 0:
+                st.session_state.pop(dirty_flag, None)
+                st.session_state["_pnl_editor_ver"] = editor_ver + 1
+                msg = f"처분손익 {saved}건 저장됨"
+                st.session_state["_stock_detail_pnl_toast"] = msg
+                st.toast(msg)
+                st.rerun()
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"처분손익 저장 실패: {exc}")
+    elif save_clicked:
+        st.info("변경된 처분손익이 없습니다. 매도 행의 처분손익을 수정한 뒤 다시 시도해 주세요.")
 
     # data_editor는 Styler 색상을 지원하지 않아, 일자 수정만 별도 편집기로 유지
     with st.expander("✏️ 거래일자 수정", expanded=False):
         edit_cols = [c for c in ("거래일자", "거래유형", "ID") if c in work.columns]
-        edited = st.data_editor(
-            work.loc[:, edit_cols],
+        edited_dates = st.data_editor(
+            work.loc[:, edit_cols].reset_index(drop=True),
             use_container_width=True,
             hide_index=True,
             num_rows="fixed",
@@ -481,7 +1308,7 @@ def show_stock_detail_modal(
             try:
                 db = get_storage()
                 updated = 0
-                for _, row in edited.iterrows():
+                for _, row in edited_dates.iterrows():
                     if pd.isna(row.get("ID")):
                         continue
                     trade_id = int(row["ID"])
@@ -505,22 +1332,33 @@ def show_stock_detail_modal(
                 st.error(str(exc))
 
 
-def _open_stock_detail_from_query(storage: Storage, trades: list) -> None:
+def _open_stock_detail_from_query(
+    storage: Storage,
+    trades: list,
+    *,
+    period_trades: list | None = None,
+) -> None:
     """세션에 쌓인 종목 상세 요청(_pending_stock_detail)으로 모달을 연다.
 
     query_params.clear()로 추가 rerun이 나더라도 pending을 pop하지 않고
     다이얼로그 dismiss 때까지 유지한다.
+
+    trades: FIFO·잔여수량 계산용 (보통 종료일까지의 전체 이력)
+    period_trades: 테이블에 보여줄 기간 필터 거래 (없으면 trades 전체)
     """
     pending = st.session_state.get("_pending_stock_detail")
-    if not pending and "stock" in st.query_params:
+    if not pending and (
+        "stock" in st.query_params or "code" in st.query_params
+    ):
         consume_stock_click_query()
         pending = st.session_state.get("_pending_stock_detail")
     if not pending:
         return
 
     stock_name = str(pending.get("stock") or "").strip()
+    stock_code = str(pending.get("code") or "").strip()
     biz_name = str(pending.get("biz") or "").strip()
-    if not stock_name:
+    if not stock_name and not stock_code:
         st.session_state.pop("_pending_stock_detail", None)
         return
 
@@ -540,16 +1378,23 @@ def _open_stock_detail_from_query(storage: Storage, trades: list) -> None:
         # 사이드바 렌더 이후이므로 다음 rerun용 pending만 남김
         st.session_state._pending_business_label = biz_name
 
+    table_src = period_trades if period_trades is not None else trades
     detail = _filter_stock_trades(
-        trades,
-        stock_name=stock_name,
+        table_src,
+        stock_name=stock_name or stock_code,
         business_name=biz_name,
+        stock_code=stock_code,
     )
+    positions, sells, _ = compute_positions(trades)
+    detail = _attach_disposal_pnl(detail, sells)
     show_stock_detail_modal(
         storage,
-        stock_name,
+        stock_name or stock_code,
         detail,
         business_name=biz_name,
+        positions=positions,
+        stock_code=stock_code,
+        all_trades=trades,
     )
 
 
@@ -558,65 +1403,88 @@ def _render_holdings_html_table(
     *,
     active_menu: str | None = None,
     market: str | None = None,
+    show_broker: bool = True,
 ) -> None:
-    """체크박스 없는 컴팩트 HTML 보유 잔고 표 (종목명 클릭 → query_params)."""
+    """보유 잔고 HTML 표 (종목명 클릭 → query_params).
+
+    컬럼: [증권사], 종목명, 보유수량, 매수가격(평단), 총 평가금액(원가잔액), 누적실현손익
+    """
     rows: list[str] = []
     sum_qty = 0.0
     sum_cost = 0.0
     sum_pnl = 0.0
+    has_broker = show_broker and "증권사" in pos_df.columns
+    has_avg = "평단가" in pos_df.columns
 
     menu = active_menu or st.session_state.get("active_menu", "domestic_dashboard")
     mkt = market or menu_market(menu) or MARKET_DOMESTIC
 
     for _, row in pos_df.iterrows():
         biz = str(row.get("사업자", "")).strip()
+        broker = str(row.get("증권사", "")).strip() if has_broker else ""
         stock = str(row.get("종목명", "")).strip()
         qty = float(row.get("잔여수량", 0) or 0)
+        avg = float(row.get("평단가", 0) or 0) if has_avg else 0.0
         cost = float(row.get("원가잔액", 0) or 0)
         pnl = float(row.get("누적실현손익", 0) or 0)
         sum_qty += qty
         sum_cost += cost
         sum_pnl += pnl
 
-        # 메뉴·시장·사업자를 URL에 실어 세션 유실 시에도 복원 가능하게 함
         href = (
             f"?stock={quote(stock)}"
             f"&menu={quote(str(menu))}"
             f"&market={quote(normalize_market(mkt))}"
             f"&market_type={quote(_market_type_param(mkt) or 'DOMESTIC')}"
         )
+        code = str(row.get("종목코드", "") or "").strip()
+        if code:
+            href += f"&code={quote(code)}"
         if biz:
             href += f"&biz={quote(biz)}"
         active_bid = st.session_state.get("active_business_id")
         if active_bid is not None:
             href += f"&business_id={int(active_bid)}"
         elif biz:
-            # 행 사업자명으로 ID를 알 수 있으면 첨부 (전체 보기일 때)
             id_by_name = st.session_state.get("_biz_id_by_name") or {}
             row_bid = id_by_name.get(biz)
             if row_bid is not None:
                 href += f"&business_id={int(row_bid)}"
         stock_link = (
             f'<a href="{html.escape(href)}" target="_self">'
-            f"{html.escape(stock or '-')}</a>"
+            f"{html.escape(stock or code or '-')}</a>"
         )
-        rows.append(
-            "<tr>"
-            f"<td class='stock'>{stock_link}</td>"
-            f"<td class='num'>{qty:,.0f} 주</td>"
-            f"<td class='num'>{cost:,.0f} 원</td>"
-            f"<td class='num'>{pnl:,.0f} 원</td>"
-            "</tr>"
-        )
+        cells = []
+        if has_broker:
+            cells.append(f"<td>{html.escape(broker or '미지정')}</td>")
+        cells.append(f"<td class='stock'>{stock_link}</td>")
+        cells.append(f"<td class='num'>{qty:,.4f} 주</td>")
+        if has_avg:
+            cells.append(f"<td class='num'>{avg:,.0f} 원</td>")
+        cells.append(f"<td class='num'>{cost:,.0f} 원</td>")
+        cells.append(f"<td class='num'>{pnl:,.0f} 원</td>")
+        rows.append("<tr>" + "".join(cells) + "</tr>")
 
-    footer = (
-        "<tr class='total'>"
-        "<td>합계</td>"
-        f"<td class='num'>{sum_qty:,.0f} 주</td>"
-        f"<td class='num'>{sum_cost:,.0f} 원</td>"
-        f"<td class='num'>{sum_pnl:,.0f} 원</td>"
-        "</tr>"
-    )
+    footer_cells = []
+    if has_broker:
+        footer_cells.append("<td></td>")
+    footer_cells.append("<td>합계</td>")
+    footer_cells.append(f"<td class='num'>{sum_qty:,.4f} 주</td>")
+    if has_avg:
+        footer_cells.append("<td class='num'>—</td>")
+    footer_cells.append(f"<td class='num'>{sum_cost:,.0f} 원</td>")
+    footer_cells.append(f"<td class='num'>{sum_pnl:,.0f} 원</td>")
+    footer = f"<tr class='total'>{''.join(footer_cells)}</tr>"
+
+    headers = []
+    if has_broker:
+        headers.append("<th>증권사</th>")
+    headers.append("<th>종목명</th>")
+    headers.append("<th>보유수량</th>")
+    if has_avg:
+        headers.append("<th>매수가격</th>")
+    headers.append("<th>총 평가금액</th>")
+    headers.append("<th>누적실현손익</th>")
 
     table_html = f"""
     <style>
@@ -671,10 +1539,7 @@ def _render_holdings_html_table(
       <table class="holdings-html">
         <thead>
           <tr>
-            <th>종목명</th>
-            <th>잔여수량</th>
-            <th>원가잔액</th>
-            <th>누적실현손익</th>
+            {''.join(headers)}
           </tr>
         </thead>
         <tbody>
@@ -689,6 +1554,7 @@ def _render_holdings_html_table(
     st.markdown(table_html, unsafe_allow_html=True)
 
 
+
 def refresh_fifo(
     storage: Storage,
     business_id: int | None = None,
@@ -698,10 +1564,49 @@ def refresh_fifo(
     return compute_positions(trades), trades
 
 
+def _trade_ymd(trade) -> str:
+    return str(getattr(trade, "trade_date", "") or "")[:10]
+
+
+def _filter_trades_by_date_range(
+    trades: list,
+    start: date | None,
+    end: date | None,
+) -> list:
+    """시작일~종료일(포함) 거래만 남긴다. None이면 해당 쪽 제한 없음."""
+    if not trades:
+        return []
+    s = start.isoformat() if isinstance(start, date) else (str(start)[:10] if start else "")
+    e = end.isoformat() if isinstance(end, date) else (str(end)[:10] if end else "")
+    out = []
+    for t in trades:
+        d = _trade_ymd(t)
+        if not d:
+            continue
+        if s and d < s:
+            continue
+        if e and d > e:
+            continue
+        out.append(t)
+    return out
+
+
+def _default_dashboard_date_range(trades: list) -> tuple[date, date]:
+    """거래 데이터의 최소~최대(없으면 올해 1/1~오늘)."""
+    today = date.today()
+    dates: list[date] = []
+    for t in trades:
+        parsed = pd.to_datetime(_trade_ymd(t), errors="coerce")
+        if pd.notna(parsed):
+            dates.append(parsed.date())
+    if not dates:
+        return date(today.year, 1, 1), today
+    return min(dates), max(dates)
+
 DOMESTIC_MENU_ITEMS = [
     ("domestic_dashboard", "📊 대시보드"),
     ("domestic_trade_input", "📝 매매 입력"),
-    ("domestic_import_export", "📤 Import / Export"),
+    ("domestic_import_export", "📤 엑셀 다운로드"),
     ("domestic_converter", "🔄 증권사 변환기"),
     ("domestic_base_data", "📋 기초 데이터 등록"),
     ("domestic_stock_masters", "🏢 거래처 및 종목 관리"),
@@ -710,7 +1615,7 @@ DOMESTIC_MENU_ITEMS = [
 OVERSEAS_MENU_ITEMS = [
     ("overseas_dashboard", "📊 대시보드"),
     ("overseas_trade_input", "📝 매매 입력"),
-    ("overseas_import_export", "📤 Import / Export"),
+    ("overseas_import_export", "📤 엑셀 다운로드"),
     ("overseas_converter", "🔄 증권사 변환기"),
     ("overseas_base_data", "📋 기초 데이터 등록"),
     ("overseas_stock_masters", "🏢 거래처 및 종목 관리"),
@@ -736,9 +1641,9 @@ for _mkt, (_title, _short) in _MARKET_TITLE.items():
     prefix = "domestic" if _mkt == MARKET_DOMESTIC else "overseas"
     MENU_PAGE_META.update(
         {
-            f"{prefix}_dashboard": (_title, f"{_short} · 대시보드 · 보유 잔고 · FIFO"),
+            f"{prefix}_dashboard": (_title, ""),
             f"{prefix}_trade_input": (_title, f"{_short} · 매수·매도 거래 입력"),
-            f"{prefix}_import_export": (_title, f"{_short} · Import / Export · 전표"),
+            f"{prefix}_import_export": (_title, ""),
             f"{prefix}_converter": (_title, f"{_short} · 증권사 거래내역 변환"),
             f"{prefix}_base_data": (_title, f"{_short} · 기초 데이터(레거시) 등록"),
             f"{prefix}_stock_masters": (_title, f"{_short} · 거래처·종목 마스터"),
@@ -771,6 +1676,8 @@ _LEGACY_TO_MENU: dict[str, str] = {
     "📝 매매 입력": "domestic_trade_input",
     "Import / Export": "domestic_import_export",
     "📤 Import / Export": "domestic_import_export",
+    "엑셀 다운로드": "domestic_import_export",
+    "📤 엑셀 다운로드": "domestic_import_export",
     "증권사 변환기": "domestic_converter",
     "🔄 증권사 변환기": "domestic_converter",
     "기초 데이터 등록": "domestic_base_data",
@@ -902,10 +1809,11 @@ def consume_stock_click_query() -> None:
     query_params 네비게이션으로 세션이 비어도 URL에 실린 컨텍스트로
     해외/국내 메뉴와 사업자가 기본값으로 덮이지 않도록 한다.
     """
-    if "stock" not in st.query_params:
+    if "stock" not in st.query_params and "code" not in st.query_params:
         return
 
     stock_name = str(st.query_params.get("stock", "") or "").strip()
+    stock_code = str(st.query_params.get("code", "") or "").strip()
     biz_name = str(st.query_params.get("biz", "") or "").strip()
     menu = str(st.query_params.get("menu", "") or "").strip()
     market_raw = str(
@@ -940,9 +1848,10 @@ def consume_stock_click_query() -> None:
     elif kept_business_id and kept_business_id.isdigit():
         st.session_state.active_business_id = int(kept_business_id)
 
-    if stock_name:
+    if stock_name or stock_code:
         st.session_state["_pending_stock_detail"] = {
-            "stock": stock_name,
+            "stock": stock_name or stock_code,
+            "code": stock_code,
             "biz": biz_name,
             "menu": st.session_state.get("active_menu"),
             "market": market_raw or (
@@ -951,7 +1860,7 @@ def consume_stock_click_query() -> None:
         }
 
     # 종목 클릭 일회성 파라미터만 제거 (menu / market_type / business_id 유지)
-    for key in ("stock", "biz", "market"):
+    for key in ("stock", "code", "biz", "market"):
         if key in st.query_params:
             del st.query_params[key]
     if kept_business_id and str(st.query_params.get("business_id", "") or "") != kept_business_id:
@@ -1162,7 +2071,16 @@ def manage_business_modal(
 
 
 def sidebar_business_selector(storage: Storage) -> int | None:
-    businesses = storage.list_businesses()
+    try:
+        businesses = storage.list_businesses()
+    except Exception as exc:  # noqa: BLE001
+        from src.supabase_client import is_transient_network_error
+
+        if is_transient_network_error(exc) or "데이터베이스 연결에 실패" in str(exc):
+            st.sidebar.error("사업자 목록을 불러오지 못했습니다. 연결을 확인해 주세요.")
+            st.sidebar.caption(str(exc))
+            return st.session_state.get("active_business_id")
+        raise
     labels = ["전체", *[b.name for b in businesses]]
     id_by_name = {b.name: b.id for b in businesses}
     # on_change 콜백에서 이름→ID 해석용
@@ -1305,9 +2223,33 @@ def sidebar_data_management(
     storage: Storage,
     business_id: int | None,
 ) -> None:
-    """사이드바 데이터 관리 — 선택 사업자 거래 삭제."""
+    """사이드바 데이터 관리 — 로컬 백업 · 선택 사업자 거래 삭제."""
+    from src.backup import BACKUP_ROOT, create_backup, latest_backup_time
+
     st.sidebar.markdown("---")
     st.sidebar.subheader("데이터 관리")
+
+    last_bt = latest_backup_time()
+    if last_bt is None:
+        st.sidebar.caption("로컬 백업: 없음")
+    else:
+        st.sidebar.caption(f"로컬 백업: {last_bt.strftime('%Y-%m-%d %H:%M')}")
+
+    if st.sidebar.button(
+        "💾 지금 로컬 백업",
+        use_container_width=True,
+        key="sidebar_backup_now",
+        help=f"Supabase 전체를 {BACKUP_ROOT} 에 JSON으로 저장",
+    ):
+        try:
+            result = create_backup(label="manual")
+            st.session_state._pending_toast = (
+                f"백업 완료 · {result.total_rows:,}행 → {result.path.name}"
+            )
+            st.rerun()
+        except Exception as exc:  # noqa: BLE001
+            st.sidebar.error(f"백업 실패: {exc}")
+
     if business_id is None:
         st.sidebar.caption("사업자를 선택하면 해당 사업자의 거래만 삭제할 수 있습니다.")
         st.sidebar.button(
@@ -1414,7 +2356,7 @@ def route_active_menu(
         elif action == "trade_input":
             page_trades(storage, business_id, market=market)
         elif action == "import_export":
-            page_import_export(storage, market=market)
+            page_excel_download(storage, market=market)
         elif action == "converter":
             page_broker(storage, market=market)
         elif action == "base_data":
@@ -1441,54 +2383,231 @@ def page_dashboard(
     market: str = MARKET_DOMESTIC,
 ) -> None:
     market = normalize_market(market)
-    st.caption(f"시장: **{market_label(market)}**")
-    (positions, _sells, _warnings), trades = refresh_fifo(
-        storage, business_id, market=market
+
+    _, all_trades = refresh_fifo(storage, business_id, market=market)
+    default_start, default_end = _default_dashboard_date_range(all_trades)
+    mkt = normalize_market(market)
+    start_key = f"dash_start_date_{mkt}_{business_id}"
+    end_key = f"dash_end_date_{mkt}_{business_id}"
+    applied_key = f"dash_applied_period_{mkt}_{business_id}"
+    legacy_range_key = f"dash_date_range_{mkt}_{business_id}"
+    query_btn_key = f"dash_query_btn_{mkt}_{business_id}"
+
+    # 구 범위 위젯 → 시작/종료 키 마이그레이션
+    if legacy_range_key in st.session_state:
+        old = st.session_state.pop(legacy_range_key, None)
+        if isinstance(old, (tuple, list)) and len(old) == 2:
+            if start_key not in st.session_state:
+                st.session_state[start_key] = old[0]
+            if end_key not in st.session_state:
+                st.session_state[end_key] = old[1]
+    if start_key not in st.session_state:
+        st.session_state[start_key] = default_start
+    if end_key not in st.session_state:
+        st.session_state[end_key] = default_end
+
+    def _as_date(v) -> date:
+        if isinstance(v, date):
+            return v
+        return date.fromisoformat(str(v)[:10])
+
+    # 실제 필터에 쓰는 적용 기간 (조회 버튼으로만 갱신)
+    if applied_key not in st.session_state:
+        st.session_state[applied_key] = {
+            "start": _as_date(st.session_state[start_key]),
+            "end": _as_date(st.session_state[end_key]),
+        }
+
+    st.markdown("##### 조회 기간")
+    d1, d2, d3 = st.columns([1, 1, 0.45], vertical_alignment="bottom")
+    with d1:
+        draft_start = st.date_input(
+            "시작일",
+            format="YYYY-MM-DD",
+            key=start_key,
+        )
+    with d2:
+        draft_end = st.date_input(
+            "종료일",
+            format="YYYY-MM-DD",
+            key=end_key,
+            help="보유잔고·원가합은 종료일 기준 FIFO로 계산합니다. 날짜 변경 후 조회를 눌러 주세요.",
+        )
+    with d3:
+        do_query = st.button(
+            "조회",
+            type="primary",
+            use_container_width=True,
+            key=query_btn_key,
+        )
+
+    applied = st.session_state[applied_key]
+    applied_start = _as_date(applied["start"])
+    applied_end = _as_date(applied["end"])
+    draft_changed = (draft_start != applied_start) or (draft_end != applied_end)
+
+    if draft_start > draft_end:
+        st.caption("시작일이 종료일보다 늦습니다. 조회 시 순서를 바꿔 적용합니다.")
+    elif draft_changed:
+        st.caption(
+            f"선택 중: **{draft_start.isoformat()} ~ {draft_end.isoformat()}** "
+            "· 조회를 누르면 반영됩니다."
+        )
+    else:
+        st.caption(
+            f"적용 중: **{applied_start.isoformat()} ~ {applied_end.isoformat()}**"
+        )
+
+    if do_query:
+        q_start, q_end = draft_start, draft_end
+        if q_start > q_end:
+            q_start, q_end = q_end, q_start
+        st.session_state[applied_key] = {"start": q_start, "end": q_end}
+        st.rerun()
+
+    start_date = applied_start
+    end_date = applied_end
+    if start_date > end_date:
+        start_date, end_date = end_date, start_date
+
+    # 종료일까지 이력 → 잔고/FIFO, 기간 내 거래 → 건수·처분·상세 표
+    trades_asof = _filter_trades_by_date_range(all_trades, None, end_date)
+    trades_period = _filter_trades_by_date_range(all_trades, start_date, end_date)
+    positions, sells_asof, warnings = compute_positions(trades_asof)
+    sells_period = [
+        s
+        for s in sells_asof
+        if start_date.isoformat() <= str(s.trade_date)[:10] <= end_date.isoformat()
+    ]
+
+    st.session_state["_dash_period"] = {
+        "start": start_date.isoformat(),
+        "end": end_date.isoformat(),
+        "market": market,
+    }
+
+    # 종목명 링크(?stock=...) 클릭 → 상세 모달 (표=기간, FIFO=종료일까지)
+    _open_stock_detail_from_query(
+        storage,
+        trades_asof,
+        period_trades=trades_period,
     )
 
-    # 종목명 링크(?stock=...) 클릭 → 상세 모달
-    _open_stock_detail_from_query(storage, trades)
-
-    held = [p for p in positions if p.quantity > 1e-12]
-    total_cost = sum(p.total_cost for p in held)
-    total_realized = sum(p.realized_pnl for p in positions)
+    held_positions = [p for p in positions if p.quantity > 1e-12]
+    held_stocks = {(p.business_id, p.stock_id) for p in held_positions}
+    total_cost = sum(p.total_cost for p in held_positions)
+    total_disposal = sum(
+        float(getattr(s, "disposal_pnl", s.realized_pnl) or 0) for s in sells_period
+    )
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("거래 건수", f"{len(trades):,}")
-    c2.metric("보유 종목 수", f"{len(held):,}")
+    c1.metric("기간 거래 건수", f"{len(trades_period):,}")
+    c2.metric("보유 종목 수", f"{len(held_stocks):,}")
     c3.metric("잔고 원가합", money(total_cost))
-    c4.metric("누적 실현손익", money(total_realized))
+    c4.metric("기간 처분손익", money(total_disposal))
+
+    if warnings:
+        st.warning(
+            "선입선출 매수 수량이 부족한 매도가 있습니다. "
+            "이전 매수(또는 기초잔고)를 등록해야 원가가 맞습니다.\n\n"
+            + "\n".join(f"- {w}" for w in warnings)
+        )
 
     st.subheader("보유 잔고")
-    st.caption("💡 종목명을 클릭하면 상세 매매 내역 팝업이 열립니다.")
 
-    pos_df = positions_to_dataframe(positions)
-    if pos_df.empty:
-        st.info("보유 잔고가 없습니다.")
+    held_positions = [p for p in positions if p.quantity > 1e-12]
+    if not held_positions and not any(abs(p.realized_pnl) > 1e-9 for p in positions):
+        st.info("선택한 종료일 기준 보유 잔고가 없습니다.")
         return
 
-    pos_df = pos_df.drop(columns=["종목코드", "평단가"], errors="ignore").reset_index(
-        drop=True
+    tab_broker, tab_total = st.tabs(
+        ["🏦 증권사별 보유", "📊 종목 합산 (전체)"]
     )
-    for col in ("잔여수량", "원가잔액", "누적실현손익"):
-        if col in pos_df.columns:
-            pos_df[col] = pd.to_numeric(pos_df[col], errors="coerce")
-    if "원가잔액" in pos_df.columns:
-        pos_df["원가잔액"] = pos_df["원가잔액"].round(0)
-    if "누적실현손익" in pos_df.columns:
-        pos_df["누적실현손익"] = pos_df["누적실현손익"].round(0)
-    if "잔여수량" in pos_df.columns:
-        pos_df["잔여수량"] = pos_df["잔여수량"].round(0)
 
-    _render_holdings_html_table(
-        pos_df,
-        active_menu=st.session_state.get("active_menu"),
-        market=market,
-    )
+    with tab_broker:
+        st.caption("증권사(계좌) × 종목 단위 FIFO 잔고 — 종목명 클릭 시 상세 내역")
+        pos_df = positions_to_dataframe(positions)
+        if pos_df.empty:
+            st.info("표시할 증권사별 잔고가 없습니다.")
+        else:
+            for col in ("잔여수량", "평단가", "원가잔액", "누적실현손익"):
+                if col in pos_df.columns:
+                    pos_df[col] = pd.to_numeric(pos_df[col], errors="coerce")
+            _render_holdings_html_table(
+                pos_df,
+                active_menu=st.session_state.get("active_menu"),
+                market=market,
+                show_broker=True,
+            )
+
+    with tab_total:
+        st.caption(
+            "동일 종목을 증권사와 무관하게 합산 — 종목명 클릭 시 상세 내역"
+        )
+        agg = aggregate_positions_by_stock(positions)
+        agg_df = positions_to_dataframe(agg)
+        if agg_df.empty:
+            st.info("합산할 잔고가 없습니다.")
+        else:
+            for col in ("잔여수량", "평단가", "원가잔액", "누적실현손익"):
+                if col in agg_df.columns:
+                    agg_df[col] = pd.to_numeric(agg_df[col], errors="coerce")
+            _render_holdings_html_table(
+                agg_df,
+                active_menu=st.session_state.get("active_menu"),
+                market=market,
+                show_broker=True,
+            )
 
 
 def _fx_to_krw(amount_fx: float, fx_rate: float) -> float:
     return float(amount_fx or 0) * float(fx_rate or 0)
+
+
+def _ov_row_float(row: object, key: str) -> float:
+    """pandas Series/dict에서 숫자 안전 추출 (NA·None → 0)."""
+    try:
+        val = row.get(key) if hasattr(row, "get") else None  # type: ignore[union-attr]
+    except Exception:  # noqa: BLE001
+        val = None
+    if val is None:
+        return 0.0
+    try:
+        if pd.isna(val):
+            return 0.0
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _ov_resolve_preview_df(*candidates: object):
+    """비어 있지 않은 미리보기 DataFrame을 후보에서 고른다."""
+    for cand in candidates:
+        if cand is None:
+            continue
+        try:
+            if getattr(cand, "empty", True):
+                continue
+            if len(cand) <= 0:  # type: ignore[arg-type]
+                continue
+            return cand
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def _ov_broker_queue_apply() -> None:
+    """일괄 등록 버튼 on_click: 등록 플래그 + 직전 세션 미리보기 스냅샷."""
+    snap = st.session_state.get("ov_broker_df")
+    st.session_state["ov_broker_apply_snapshot"] = (
+        snap.copy(deep=True) if snap is not None else None
+    )
+    st.session_state["ov_broker_do_apply"] = True
+    # 환율 재계산 리런과 버튼이 겹쳐도 등록이 유실되지 않게 함
+    st.session_state["ov_broker_apply_pending"] = True
 
 
 def page_overseas_trades(storage: Storage, business_id: int | None) -> None:
@@ -1551,6 +2670,26 @@ def render_overseas_trade_input(storage: Storage, business_id: int | None) -> No
         placeholder="비우면 티커를 종목명으로 사용",
         key="ov_stock_name",
     ).strip()
+
+    accounts = storage.list_accounts(business_id, market=MARKET_OVERSEAS)
+    acct_names = [a.name for a in accounts]
+    broker_choice = st.selectbox(
+        "증권사 / 계좌",
+        ["(직접 입력)", *acct_names],
+        key="ov_broker_select",
+        help="동일 종목이어도 증권사별로 FIFO·잔고가 분리됩니다.",
+    )
+    broker_typed = ""
+    if broker_choice == "(직접 입력)":
+        broker_typed = st.text_input(
+            "증권사명",
+            value=st.session_state.get("_ov_preferred_broker", ""),
+            placeholder="예: 미래에셋증권, KB증권, 메리츠증권",
+            key="ov_broker_typed",
+        ).strip()
+    broker_name = (
+        broker_typed if broker_choice == "(직접 입력)" else broker_choice
+    )
 
     c_qty, c_price, c_fee, c_tax = st.columns(4)
     with c_qty:
@@ -1648,6 +2787,13 @@ def render_overseas_trade_input(storage: Storage, business_id: int | None) -> No
             stock = storage.get_or_create_stock(
                 ticker, name, business_id=int(business_id), market=MARKET_OVERSEAS
             )
+            if not broker_name:
+                raise ValueError("증권사(계좌)를 선택하거나 입력하세요.")
+            acct = storage.get_or_create_account(
+                broker_name,
+                int(business_id),
+                market=MARKET_OVERSEAS,
+            )
 
             price_krw = _fx_to_krw(price_fx, fx_rate)
             fee_krw = _fx_to_krw(fee_fx, fx_rate)
@@ -1677,13 +2823,16 @@ def render_overseas_trade_input(storage: Storage, business_id: int | None) -> No
                 price_fx=float(price_fx),
                 fee_fx=float(fee_fx),
                 tax_fx=float(tax_fx),
+                account_id=int(acct.id) if acct.id is not None else None,
+                account_name=acct.name,
             )
             storage.add_trade(trade)
             st.session_state["_ov_last_fx"] = float(fx_rate)
             st.session_state["_ov_preferred_ticker"] = ticker
+            st.session_state["_ov_preferred_broker"] = broker_name
             st.session_state["_show_ov_trade_toast"] = True
             st.session_state["_ov_trade_toast_msg"] = (
-                f"✅ {side_label} 저장 · {ticker} {q:g}주 · ₩{settle:,.0f}"
+                f"✅ {side_label} 저장 · {acct.name} · {ticker} {q:g}주 · ₩{settle:,.0f}"
             )
             st.rerun()
         except Exception as exc:  # noqa: BLE001
@@ -1696,12 +2845,24 @@ def _render_overseas_trade_list(storage: Storage, business_id: int | None) -> No
     if not trades:
         st.info("해외주식 거래 내역이 없습니다.")
         return
+    _, sells, _ = compute_positions(trades)
+    by_id = sells_by_trade_id(sells)
     rows = []
     for t in reversed(trades[-200:]):
+        sell = None
+        try:
+            if t.id is not None:
+                sell = by_id.get(int(t.id))
+        except (TypeError, ValueError):
+            sell = None
+        pnl = None
+        if sell is not None:
+            pnl = float(getattr(sell, "disposal_pnl", sell.realized_pnl) or 0)
         rows.append(
             {
                 "ID": t.id,
                 "거래일자": t.trade_date,
+                "증권사": getattr(t, "account_name", "") or "미지정",
                 "유형": (
                     "매수"
                     if t.side == "BUY"
@@ -1717,6 +2878,7 @@ def _render_overseas_trade_list(storage: Storage, business_id: int | None) -> No
                 "원화단가": t.price,
                 "원화수수료": t.fee,
                 "원화장산": t.settlement_amount,
+                "처분손익": pnl,
             }
         )
     odf = pd.DataFrame(rows)
@@ -1734,6 +2896,7 @@ def _render_overseas_trade_list(storage: Storage, business_id: int | None) -> No
             "원화단가": st.column_config.NumberColumn("원화단가", format="%,d 원"),
             "원화수수료": st.column_config.NumberColumn("원화수수료", format="%,d 원"),
             "원화장산": st.column_config.NumberColumn("원화장산", format="%,d 원"),
+            "처분손익": st.column_config.NumberColumn("처분손익", format="%,d 원"),
             "ID": st.column_config.NumberColumn("ID", format="%d"),
         },
     )
@@ -1813,6 +2976,26 @@ def page_trades(
             horizontal=True,
             key="trade_side",
         )
+
+    accounts = storage.list_accounts(business_id, market=market)
+    acct_names = [a.name for a in accounts]
+    broker_choice = st.selectbox(
+        "증권사 / 계좌",
+        ["(직접 입력)", *acct_names],
+        key="trade_broker_select",
+        help="동일 종목이어도 증권사별로 FIFO·잔고가 분리됩니다.",
+    )
+    broker_typed = ""
+    if broker_choice == "(직접 입력)":
+        broker_typed = st.text_input(
+            "증권사명",
+            value=st.session_state.get("_preferred_broker", ""),
+            placeholder="예: 키움증권, DB금융투자, 미래에셋증권",
+            key="trade_broker_typed",
+        ).strip()
+    broker_name = (
+        broker_typed if broker_choice == "(직접 입력)" else broker_choice
+    )
 
     stock_options = [NEW_STOCK_OPTION, *[f"{s.name} ({s.code})" for s in stocks]]
     preferred = st.session_state.get("_preferred_stock")
@@ -1911,6 +3094,13 @@ def page_trades(
                 if side == "BUY"
                 else float(quantity) * float(price) - float(fee)
             )
+            if not broker_name:
+                raise ValueError("증권사(계좌)를 선택하거나 입력하세요.")
+            acct = storage.get_or_create_account(
+                broker_name,
+                int(business.id),  # type: ignore[arg-type]
+                market=market,
+            )
 
             trade = Trade(
                 id=None,
@@ -1926,17 +3116,22 @@ def page_trades(
                 memo=str(memo or ""),
                 source="manual",
                 created_at=now_str(),
+                account_id=int(acct.id) if acct.id is not None else None,
+                account_name=acct.name,
             )
             tid = storage.add_trade(trade)
+            st.session_state["_preferred_broker"] = broker_name
 
-            toast_msg = "✅ 거래가 성공적으로 저장되었습니다!"
+            toast_msg = f"✅ 거래 저장 · {acct.name}"
             if side == "SELL":
                 preview = storage.list_trades(
                     business_id=business.id, stock_id=stock.id
                 )
                 _, sells, _warnings = compute_positions(preview)
                 if sells:
-                    toast_msg += f" · 실현손익 {money(sells[-1].realized_pnl)}원"
+                    last = sells[-1]
+                    pnl = float(getattr(last, "disposal_pnl", last.realized_pnl) or 0)
+                    toast_msg += f" · 처분손익 {money(pnl)}원"
 
             st.session_state["_trade_toast_msg"] = toast_msg
             st.session_state["_show_trade_toast"] = True
@@ -1966,8 +3161,10 @@ def _render_trade_list(
         st.info("거래 내역이 없습니다.")
         return
 
+    _, sells, _ = compute_positions(trades)
+    df = _attach_disposal_pnl(df, sells)
     view = df.drop(columns=["출처"], errors="ignore").copy()
-    for col in ("수량", "거래금액(원가)", "단가", "수수료", "제세금", "정산금액", "ID"):
+    for col in ("수량", "거래금액(원가)", "단가", "수수료", "제세금", "정산금액", "처분손익", "ID"):
         if col in view.columns:
             view[col] = pd.to_numeric(view[col], errors="coerce")
 
@@ -1975,6 +3172,7 @@ def _render_trade_list(
     preferred = [
         "거래일자",
         "사업자",
+        "증권사",
         "종목코드",
         "종목명",
         "거래유형",
@@ -1984,6 +3182,7 @@ def _render_trade_list(
         "수수료",
         "제세금",
         "정산금액",
+        "처분손익",
         "메모",
         "ID",
     ]
@@ -2006,19 +3205,87 @@ def _render_trade_list(
             st.rerun()
 
 
-def page_import_export(
+def _apply_export_memo_mode(trades_df: pd.DataFrame, memo_mode: str) -> pd.DataFrame:
+    """원본 거래 DF에서 적요/메모를 선택 형식으로 재생성.
+
+    memo_mode: 'stock' | 'amount'
+    - 엑셀·CSV 모두 '적요' 컬럼을 쓰며, 기존 '메모'는 동일 값으로 맞춤.
+    - amount 모드는 최장 적요 길이에 공백 패딩.
+    """
+    if trades_df is None or trades_df.empty:
+        return trades_df
+    out = trades_df.copy()
+    mode = (memo_mode or "stock").strip().lower()
+    if mode == "amount":
+        raw = [_format_memo_ccy_amount_qty(row) for _, row in out.iterrows()]
+        memos = _pad_memo_strings(raw)
+    else:
+        memos = [_format_memo_stock_qty_fx(row) for _, row in out.iterrows()]
+
+    out["적요"] = memos
+    out["메모"] = memos
+    return out
+
+
+_IE_MEMO_OPTIONS: dict[str, str] = {
+    "옵션1: 종목명 / @수량 * 단가 * 환율": "stock",
+    "옵션2: 통화·외화총액 / 수량*단가 * 환율": "amount",
+}
+
+
+def _resolve_ie_memo_mode(market: str, label: object | None = None) -> str:
+    """라디오·session_state에서 적요 모드(stock|amount) 확정."""
+    key = f"ie_memo_fmt_v3_{normalize_market(market)}"
+    raw = label if label is not None else st.session_state.get(key)
+    if raw in _IE_MEMO_OPTIONS:
+        return _IE_MEMO_OPTIONS[raw]
+    text = str(raw or "")
+    if "옵션2" in text or "외화총액" in text or "통화" in text:
+        return "amount"
+    return "stock"
+
+
+def _build_ledger_excel_bytes(
+    trades_df: pd.DataFrame,
+    pos_df: pd.DataFrame,
+    sell_df: pd.DataFrame,
+    memo_mode: str,
+) -> bytes:
+    """엑셀 바이트 생성 직전 적요를 선택 형식으로 재적용."""
+    export_df = _apply_export_memo_mode(trades_df, memo_mode)
+    # 다운로드 시트에는 적요만 노출 (메모 중복 제거, 메모 자리에 적요)
+    if export_df is not None and not export_df.empty and "적요" in export_df.columns:
+        ordered: list[str] = []
+        for c in export_df.columns:
+            if c == "메모":
+                if "적요" not in ordered:
+                    ordered.append("적요")
+                continue
+            if c not in ordered:
+                ordered.append(c)
+        if "적요" not in ordered:
+            ordered.append("적요")
+        export_df = export_df.loc[:, [c for c in ordered if c in export_df.columns]]
+    return export_to_excel_bytes(
+        export_df,
+        pos_df,
+        sell_df,
+        text_columns=["적요"],
+    )
+
+
+def page_excel_download(
     storage: Storage,
     market: str = MARKET_DOMESTIC,
 ) -> None:
+    """엑셀 다운로드(적요 형식·회계 전표). 구 page_import_export."""
     market = normalize_market(market)
-    st.caption(f"시장: **{market_label(market)}**")
-    st.subheader("Export")
+    st.subheader("엑셀 다운로드")
+    st.caption("기간을 선택한 뒤 회계 전표 엑셀을 내려받습니다.")
+
     business_id = st.session_state.get("active_business_id")
     trades = storage.list_trades(business_id=business_id, market=market)
-    positions, sells, _ = compute_positions(trades)
-    trades_df = trades_to_dataframe(trades)
-    pos_df = positions_to_dataframe(positions)
-    sell_df = sell_results_to_dataframe(sells)
+    _, _, fifo_warnings = compute_positions(trades)
 
     company_name = ""
     if business_id is not None:
@@ -2027,38 +3294,39 @@ def page_import_export(
                 company_name = b.name
                 break
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.download_button(
-            "거래내역 CSV",
-            data=export_to_csv_bytes(trades_df),
-            file_name="trades.csv",
-            mime="text/csv",
-        )
-    with c2:
-        st.download_button(
-            "잔고 CSV",
-            data=export_to_csv_bytes(pos_df),
-            file_name="positions.csv",
-            mime="text/csv",
-        )
-    with c3:
-        xlsx = export_to_excel_bytes(trades_df, pos_df, sell_df)
-        st.download_button(
-            "전체 Excel (거래/잔고/실현손익)",
-            data=xlsx,
-            file_name="stock_ledger.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-
-    st.markdown("##### 회계 전표 전송 양식")
-    st.caption(
-        "원본 '엑셀자료일반전표전송.xls' 양식(헤더 10행 유지, 11행부터 분개)에 맞춰 "
-        "지정 기간 거래를 생성합니다. FIFO 원가는 전체 이력을 반영합니다."
+    # ── 적요 형식 ──────────────────────────────────────────────
+    st.subheader("적요 형식")
+    radio_key = f"ie_memo_fmt_v3_{market}"
+    memo_labels = list(_IE_MEMO_OPTIONS.keys())
+    memo_mode_label = st.radio(
+        "적요 형식",
+        options=memo_labels,
+        index=0,
+        horizontal=False,
+        key=radio_key,
+        label_visibility="collapsed",
+        help=(
+            "회계 전표 엑셀의 적요에 적용됩니다. "
+            "옵션2는 '/' 앞부분(통화·금액)을 최장 길이에 맞춰 공백 패딩합니다."
+        ),
     )
+    memo_mode = _resolve_ie_memo_mode(market, memo_mode_label)
+    st.session_state[f"ie_memo_mode_resolved_{market}"] = memo_mode
+    resolved = st.session_state.get(f"ie_memo_mode_resolved_{market}", memo_mode)
+    if memo_mode == "stock":
+        st.caption("예: INVESCO NASDAQ 100 매수 / @40주 * $247.67 * 1442.00원")
+    else:
+        st.caption("예: USD 1862.29 / 5주*371.529 * 1528.6  ('/' 앞부분 공백 패딩)")
 
+    if fifo_warnings:
+        st.caption(
+            f"⚠️ FIFO 매수 수량 부족 {len(fifo_warnings)}건 · "
+            + " · ".join(str(w) for w in fifo_warnings[:3])
+            + (" …" if len(fifo_warnings) > 3 else "")
+        )
+
+    # ── 조회 기간 ──────────────────────────────────────────────
     today = date.today()
-    # 구버전 range 키 → 분리 키 마이그레이션
     if "voucher_date_range" in st.session_state and "voucher_start_date" not in st.session_state:
         old = st.session_state.pop("voucher_date_range", None)
         if isinstance(old, (list, tuple)) and len(old) == 2:
@@ -2071,16 +3339,17 @@ def page_import_export(
     if "voucher_end_date" not in st.session_state:
         st.session_state["voucher_end_date"] = today
 
-    qb1, qb2, qb3 = st.columns(3)
-    if qb1.button("이번 달", use_container_width=True, key="voucher_preset_month"):
+    st.subheader("조회 기간")
+    p1, p2, p3 = st.columns(3)
+    if p1.button("이번 달", use_container_width=True, key=f"voucher_preset_month_{market}"):
         st.session_state["voucher_start_date"] = date(today.year, today.month, 1)
         st.session_state["voucher_end_date"] = today
         st.rerun()
-    if qb2.button("올해 (1월~현재)", use_container_width=True, key="voucher_preset_year"):
+    if p2.button("올해", use_container_width=True, key=f"voucher_preset_year_{market}"):
         st.session_state["voucher_start_date"] = date(today.year, 1, 1)
         st.session_state["voucher_end_date"] = today
         st.rerun()
-    if qb3.button("전체 기간", use_container_width=True, key="voucher_preset_all"):
+    if p3.button("전체", use_container_width=True, key=f"voucher_preset_all_{market}"):
         if trades:
             dates = sorted(str(t.trade_date)[:10] for t in trades)
             st.session_state["voucher_start_date"] = date.fromisoformat(dates[0])
@@ -2090,24 +3359,23 @@ def page_import_export(
             st.session_state["voucher_end_date"] = today
         st.rerun()
 
-    col_d1, col_d2 = st.columns(2)
-    with col_d1:
+    d1, d2 = st.columns(2)
+    with d1:
         start_date = st.date_input(
-            "📅 시작일 선택",
+            "시작일",
             format="YYYY-MM-DD",
             key="voucher_start_date",
         )
-    with col_d2:
+    with d2:
         end_date = st.date_input(
-            "📅 종료일 선택",
+            "종료일",
             format="YYYY-MM-DD",
             key="voucher_end_date",
         )
     if start_date > end_date:
         start_date, end_date = end_date, start_date
-        st.caption("※ 시작일이 종료일보다 늦어 순서를 바꿔 조회합니다.")
+        st.caption("시작일이 종료일보다 늦어 순서를 바꿔 조회합니다.")
 
-    # 기간 내 전표용 거래 + 전체 이력 FIFO(매도 원가)
     period_trades = storage.get_trades_by_period(
         business_id, start_date, end_date, market=market
     )
@@ -2118,99 +3386,125 @@ def page_import_export(
         for s in storage.list_stocks(business_id, market=market)
         if s.id is not None
     }
-    line_count = (
-        len(
-            trades_to_voucher_lines(
+
+    # ── 다운로드 ────────────────────────────────────────────────
+    st.markdown(
+        """
+<style>
+div[data-testid="stDownloadButton"] button {
+    border-radius: 10px !important;
+    font-weight: 600 !important;
+    font-size: 0.95rem !important;
+    padding: 0.5rem 1.25rem !important;
+    min-height: 2.4rem !important;
+    border: 1px solid #cbd5e1 !important;
+    background-color: #f8fafc !important;
+    color: #334155 !important;
+    box-shadow: none !important;
+}
+div[data-testid="stDownloadButton"] button:hover:not(:disabled) {
+    background-color: #eff6ff !important;
+    border-color: #93c5fd !important;
+    color: #1d4ed8 !important;
+}
+div[data-testid="stDownloadButton"] button:disabled {
+    opacity: 0.55 !important;
+}
+/* 엑셀 다운로드 페이지 · 섹션 간격 압축 */
+div[data-testid="stVerticalBlock"] > div:has(> div[data-testid="stRadio"]),
+div[data-testid="stVerticalBlock"] > div:has(> div[data-testid="stButton"]) {
+    margin-bottom: 0.15rem;
+}
+</style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    _l, mid, _r = st.columns([1.35, 1.3, 1.35])
+    with mid:
+        st.caption(
+            "기간 선택 후 아래 버튼을 클릭하여 회계 전표 엑셀 파일을 다운로드하세요."
+        )
+        if not period_trades:
+            st.download_button(
+                "회계 전표 엑셀 다운로드",
+                data=b"",
+                file_name="empty.xlsx",
+                disabled=True,
+                use_container_width=True,
+                type="secondary",
+                key=f"voucher_dl_empty_{market}",
+            )
+            st.caption("선택한 기간에 거래가 없습니다.")
+        else:
+            voucher_bytes = export_voucher_excel_bytes(
                 period_trades,
                 all_sells,
+                company_name=company_name,
                 account_config=account_config,
                 partner_by_stock_id=partner_by_stock_id,
+                remark_mode=resolved,
             )
-        )
-        if period_trades
-        else 0
-    )
+            filename = (
+                f"엑셀자료일반전표전송_주식매매_"
+                f"{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.xlsx"
+            )
+            st.download_button(
+                "회계 전표 엑셀 다운로드",
+                data=voucher_bytes,
+                file_name=filename,
+                mime=(
+                    "application/vnd.openxmlformats-officedocument"
+                    ".spreadsheetml.sheet"
+                ),
+                type="secondary",
+                use_container_width=True,
+                key=(
+                    f"voucher_dl_{resolved}_{market}_"
+                    f"{start_date}_{end_date}_{len(voucher_bytes)}"
+                ),
+            )
 
-    st.info(
-        f"선택된 기간: **{start_date.isoformat()} ~ {end_date.isoformat()}** "
-        f"(총 {len(period_trades)}건의 거래, {line_count}줄의 분개 생성)"
-    )
 
-    if not period_trades:
-        st.info("💡 선택한 기간에 해당하는 거래 내역이 없습니다.")
-        st.download_button(
-            f"📥 {start_date} ~ {end_date} 회계 전표 엑셀 다운로드",
-            data=b"",
-            file_name="empty.xlsx",
-            disabled=True,
-            use_container_width=True,
-        )
-    else:
-        voucher_bytes = export_voucher_excel_bytes(
-            period_trades,
-            all_sells,
-            company_name=company_name,
-            account_config=account_config,
-            partner_by_stock_id=partner_by_stock_id,
-        )
-        filename = (
-            f"엑셀자료일반전표전송_주식매매_"
-            f"{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.xlsx"
-        )
-        st.download_button(
-            f"📥 {start_date} ~ {end_date} 회계 전표 엑셀 다운로드",
-            data=voucher_bytes,
-            file_name=filename,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary",
-            use_container_width=True,
-        )
-
-    st.divider()
-    st.subheader("표준 양식 Import (CSV/Excel)")
-    st.caption(
-        "필수 컬럼: 거래일자, 종목코드, 거래유형, 수량, 단가 / "
-        "선택: 사업자, 종목명, 수수료, 정산금액, 메모"
-    )
-
-    businesses = storage.list_businesses()
-    default_biz = st.selectbox(
-        "사업자 컬럼이 없을 때 기본 사업자",
-        [b.name for b in businesses] if businesses else ["(먼저 사업자 등록)"],
-    )
-    up = st.file_uploader("매매일지 파일 업로드", type=["csv", "xlsx", "xls"], key="std_up")
-    if up and businesses:
-        if st.button("표준 양식 일괄 등록", type="primary"):
-            try:
-                count, errors = import_standard_file(
-                    up.getvalue(),
-                    up.name,
-                    storage,
-                    default_business=default_biz,
-                    market=market,
-                )
-                st.success(f"{count}건 등록 완료")
-                if errors:
-                    with st.expander(f"오류/스킵 {len(errors)}건"):
-                        for e in errors:
-                            st.write(e)
-                st.rerun()
-            except Exception as exc:  # noqa: BLE001
-                st.error(str(exc))
+# 하위 호환 별칭
+page_import_export = page_excel_download
 
 
 def page_broker_overseas(storage: Storage) -> None:
-    """미래에셋 해외주식 거래내역서 PDF → 검수 후 일괄 등록."""
+    """해외주식 증권사 변환기: 파일 자동 식별 → 검수 후 일괄 등록."""
     from src.brokers.mirae_overseas import (
+        apply_overseas_preview_fx,
+        ensure_overseas_preview_columns,
         mirae_rows_to_preview_df,
-        parse_mirae_overseas_pdf,
     )
 
     st.subheader("해외주식 증권사 변환기")
     st.caption(
-        "미래에셋증권 해외주식 거래내역서 PDF(해외주식매수입고·매도출고·배당금외화입금)를 "
-        "파싱한 뒤 검수·수정하여 해외주식 매매일지에 반영합니다."
+        "파일을 올리면 컬럼·파일명으로 증권사를 자동 인식합니다. "
+        "지원: 미래에셋 PDF, KB·메리츠 해외주식 엑셀. "
+        "인식되지 않을 때만 증권사를 선택하세요."
     )
+
+    # 일괄 등록 직후 rerun 에서도 보이도록 플래시 메시지
+    flash = st.session_state.pop("_ov_broker_flash", None)
+    if isinstance(flash, dict):
+        level = str(flash.get("level") or "success")
+        text = str(flash.get("message") or "").strip()
+        if text:
+            if level == "error":
+                st.error(text)
+            elif level == "warning":
+                st.warning(text)
+            else:
+                st.success(text)
+            detail = flash.get("detail")
+            if detail:
+                with st.expander("상세", expanded=False):
+                    if isinstance(detail, list):
+                        for line in detail:
+                            st.write(line)
+                    else:
+                        st.write(detail)
 
     businesses = storage.list_businesses()
     if not businesses:
@@ -2227,38 +3521,105 @@ def page_broker_overseas(storage: Storage) -> None:
                 break
 
     biz = st.selectbox("반영할 사업자", biz_names, index=default_idx, key="ov_broker_biz")
+
+    need_manual = bool(st.session_state.get("ov_broker_need_manual"))
+    broker_hint = "자동 감지"
+    if need_manual:
+        broker_hint = st.selectbox(
+            "증권사 (자동 인식 실패 — 선택 필요)",
+            ["자동 감지", "미래에셋증권", "KB증권", "메리츠증권"],
+            key="ov_broker_manual",
+            help="파일 양식을 자동으로 찾지 못했습니다. 증권사를 고른 뒤 같은 파일을 다시 올려 주세요.",
+        )
+
+    # 파서 로직 변경 시 같은 파일도 재파싱 (세션에 옛 메리츠 결과 남는 문제 방지)
+    OV_PARSE_VER = 3
+    up_ver = int(st.session_state.get("ov_broker_up_ver") or 0)
     up = st.file_uploader(
-        "미래에셋 해외주식 거래내역서 PDF",
-        type=["pdf"],
-        key="ov_broker_up",
+        "해외주식 거래내역 (PDF / Excel)",
+        type=["pdf", "xlsx", "xls"],
+        key=f"ov_broker_up_{up_ver}",
+        help="파일만 올리면 증권사를 자동 판별합니다.",
     )
 
     if up:
-        token = f"{up.name}:{up.size}:{biz}"
+        token = f"{up.name}:{up.size}:{broker_hint}:v{OV_PARSE_VER}"
         if st.session_state.get("ov_broker_token") != token:
-            result = parse_mirae_overseas_pdf(up.getvalue(), up.name)
+            name = up.name or ""
+            file_bytes = up.getvalue()
+            if need_manual and broker_hint != "자동 감지":
+                result = parse_overseas_with_hint(file_bytes, name, broker_hint)
+            else:
+                result = detect_and_parse_overseas(file_bytes, name)
+
+            identified = bool(result.get("identified")) and bool(result.get("rows"))
+            # 인식은 됐지만 0건이면 미리보기는 비움 — 오판(예: 메리츠) 방지
+            if result.get("broker_name") and not result.get("rows"):
+                # 컬럼 불일치로 0건이면 미식별로 보고 수동 선택 유도
+                if any("찾지 못했" in str(n) for n in (result.get("notes") or [])):
+                    identified = False
+                    result = {
+                        **result,
+                        "identified": False,
+                        "notes": [
+                            *[
+                                n
+                                for n in (result.get("notes") or [])
+                                if "양식으로 인식" not in str(n)
+                            ],
+                            "증권사 자동 인식이 맞지 않은 것 같습니다. "
+                            "아래에서 증권사를 선택한 뒤 같은 파일을 다시 올려 주세요.",
+                        ],
+                    }
+
+            st.session_state.ov_broker_need_manual = not identified
             st.session_state.ov_broker_token = token
             st.session_state.ov_broker_notes = result.get("notes") or []
+            st.session_state.ov_broker_source = result.get("source") or "overseas"
+            st.session_state.ov_broker_name = result.get("broker_name")
             st.session_state.ov_broker_df = mirae_rows_to_preview_df(
                 result.get("rows") or []
             )
+            st.session_state.pop("ov_broker_editor", None)
+            st.session_state.pop("ov_broker_editor_ver", None)
 
     for note in st.session_state.get("ov_broker_notes") or []:
-        st.info(note)
+        note_s = str(note)
+        if "양식으로 인식" in note_s or "양식으로 처리" in note_s:
+            st.success(note_s)
+        elif "인식하지" in note_s or ("선택" in note_s and "증권사" in note_s):
+            st.warning(note_s)
+        else:
+            st.info(note_s)
 
     df = st.session_state.get("ov_broker_df")
     if df is None or getattr(df, "empty", True):
-        st.info("PDF를 업로드하면 파싱 미리보기가 표시됩니다.")
+        if st.session_state.get("ov_broker_need_manual"):
+            st.warning("위에서 증권사를 선택한 뒤, 동일 파일을 다시 업로드해 주세요.")
+        else:
+            st.info("PDF 또는 엑셀을 업로드하면 자동 인식 후 미리보기가 표시됩니다.")
         return
 
     st.markdown("### 파싱 미리보기 (검수 및 수정)")
+    st.caption(
+        "적용환율이 0인 행은 **적용환율** 칸에 직접 입력하세요. "
+        "입력 즉시 원화단가·외화거래금액·거래금액(원)·메모가 재계산됩니다. "
+        "외화거래금액 = 수량 × 외화단가, "
+        "거래금액(원) = 수량 × 외화단가 × 적용환율 (수수료·제세금 제외). "
+        "아래 버튼은 미리보기 **전체 행**을 선택한 사업자로 등록합니다."
+    )
+    df = ensure_overseas_preview_columns(df)
+    # 내부 계산용 수치는 에디터에 노출하지 않음
+    editor_df = df.drop(columns=["외화거래금액_수치"], errors="ignore")
+    editor_ver = int(st.session_state.get("ov_broker_editor_ver") or 0)
     edited = st.data_editor(
-        df,
+        editor_df,
         num_rows="dynamic",
         use_container_width=True,
         hide_index=True,
-        key="ov_broker_editor",
+        key=f"ov_broker_editor_{editor_ver}",
         column_config={
+            "증권사": st.column_config.TextColumn("증권사", width="small"),
             "거래유형": st.column_config.SelectboxColumn(
                 "거래유형",
                 options=["해외매수", "해외매도", "외화배당"],
@@ -2268,17 +3629,102 @@ def page_broker_overseas(storage: Storage) -> None:
             "외화단가": st.column_config.NumberColumn("외화단가", format="%.4f"),
             "외화수수료": st.column_config.NumberColumn("외화수수료", format="%.4f"),
             "외화제세금": st.column_config.NumberColumn("외화제세금", format="%.4f"),
-            "적용환율": st.column_config.NumberColumn("적용환율", format="%.2f"),
+            "적용환율": st.column_config.NumberColumn(
+                "적용환율",
+                format="%.2f",
+                min_value=0.0,
+                step=0.1,
+                help="0이면 직접 입력 → 원화·메모 자동 환산",
+            ),
+            "원화단가": st.column_config.NumberColumn(
+                "원화단가", format="%.0f", help="외화단가 × 적용환율"
+            ),
+            "원화수수료": st.column_config.NumberColumn(
+                "원화수수료", format="%.0f", help="외화수수료 × 적용환율"
+            ),
+            "원화재세금": st.column_config.NumberColumn(
+                "원화재세금", format="%.0f", help="외화제세금 × 적용환율"
+            ),
+            "외화거래금액": st.column_config.TextColumn(
+                "외화거래금액",
+                help="수량 × 외화단가 (예: 5,588.40 USD). 원본 외화 거래금액이 있으면 우선",
+                width="medium",
+            ),
+            "거래금액(원)": st.column_config.NumberColumn(
+                "거래금액(원)",
+                format="%.0f",
+                help="수량 × 외화단가 × 적용환율 (수수료·제세금 제외)",
+            ),
         },
+        disabled=[
+            "원화단가",
+            "원화수수료",
+            "원화재세금",
+            "외화거래금액",
+            "거래금액(원)",
+        ],
     )
-    st.session_state.ov_broker_df = edited
 
-    if not st.button(
+    recalced = apply_overseas_preview_fx(edited)
+    # data_editor가 빈 DF를 반환하는 경우(위젯 리셋 경합) 세션 데이터를 지키다
+    if recalced is None or getattr(recalced, "empty", True):
+        if editor_df is not None and not getattr(editor_df, "empty", True):
+            recalced = editor_df
+            st.session_state.ov_broker_df = editor_df
+        else:
+            st.session_state.ov_broker_df = recalced
+    else:
+        st.session_state.ov_broker_df = recalced
+
+    # 적용환율(사용자 입력)만 보고 에디터 새로고침 — 계산컬럼 dtype 차이로 인한 오탐 방지
+    fx_changed = False
+    try:
+        if (
+            recalced is not None
+            and not getattr(recalced, "empty", True)
+            and len(recalced) == len(editor_df)
+        ):
+            prev_fx = (
+                pd.to_numeric(editor_df["적용환율"], errors="coerce")
+                .fillna(0.0)
+                .astype(float)
+                .reset_index(drop=True)
+            )
+            new_fx = (
+                pd.to_numeric(recalced["적용환율"], errors="coerce")
+                .fillna(0.0)
+                .astype(float)
+                .reset_index(drop=True)
+            )
+            if not prev_fx.equals(new_fx):
+                fx_changed = True
+        elif (
+            recalced is not None
+            and not getattr(recalced, "empty", True)
+            and len(recalced) != len(editor_df)
+        ):
+            # 행 추가/삭제 시에만 에디터 새로고침 (빈 DF 오탐은 제외)
+            fx_changed = True
+    except Exception:  # noqa: BLE001
+        fx_changed = False
+
+    if fx_changed:
+        st.session_state.ov_broker_editor_ver = editor_ver + 1
+        st.rerun()
+
+    st.button(
         "선택된 사업자로 해외주식 거래 일괄 등록",
         type="primary",
         use_container_width=True,
         key="ov_broker_apply",
-    ):
+        on_click=_ov_broker_queue_apply,
+    )
+
+    do_apply = bool(
+        st.session_state.pop("ov_broker_do_apply", False)
+        or st.session_state.pop("ov_broker_apply_pending", False)
+    )
+    if not do_apply:
         return
 
     try:
@@ -2286,32 +3732,68 @@ def page_broker_overseas(storage: Storage) -> None:
         bid = int(business.id)  # type: ignore[arg-type]
         trades: list = []
         errors: list[str] = []
-        for idx, row in edited.iterrows():
+        skipped_div = 0
+
+        snap = st.session_state.pop("ov_broker_apply_snapshot", None)
+        # 이번 렌더 에디터 결과 우선, 없으면 on_click 스냅샷/세션
+        to_save = _ov_resolve_preview_df(
+            recalced,
+            edited,
+            snap,
+            st.session_state.get("ov_broker_df"),
+        )
+        if to_save is None:
+            err_msg = "등록 중 오류가 발생했습니다. 등록할 미리보기 행이 없습니다."
+            st.error(
+                f"{err_msg} "
+                f"(snapshot={0 if snap is None else len(snap)}, "
+                f"editor={0 if edited is None else len(edited)}, "
+                f"session={0 if st.session_state.get('ov_broker_df') is None else len(st.session_state['ov_broker_df'])})"
+            )
+            st.toast(err_msg, icon="⚠️")
+            return
+
+        to_save = apply_overseas_preview_fx(to_save)
+        st.session_state.ov_broker_df = to_save
+
+        for idx, row in to_save.iterrows():
+            row_label = str(int(idx) + 1) if isinstance(idx, (int, float)) else str(idx)
             try:
                 ticker = str(row.get("종목코드") or "").strip().upper()
                 name = str(row.get("종목명") or ticker).strip() or ticker
                 if not ticker:
+                    ticker = name[:12].upper() if name else ""
+                if not ticker:
                     raise ValueError("종목코드 없음")
-                qty = float(row.get("수량") or 0)
-                price_fx = float(row.get("외화단가") or 0)
-                fee_fx = float(row.get("외화수수료") or 0)
-                tax_fx = float(row.get("외화제세금") or 0)
-                fx = float(row.get("적용환율") or 0)
+                qty = _ov_row_float(row, "수량")
+                price_fx = _ov_row_float(row, "외화단가")
+                fee_fx = _ov_row_float(row, "외화수수료")
+                tax_fx = _ov_row_float(row, "외화제세금")
+                fx = coerce_fx_rate(row.get("적용환율"))
                 ccy = normalize_currency(str(row.get("통화코드") or "USD"))
-                kind = str(row.get("거래유형") or "")
-                if kind == "해외매수":
-                    side = "BUY"
-                elif kind == "해외매도":
-                    side = "SELL"
-                else:
-                    side = "DIVIDEND"
-                    if qty <= 0:
-                        qty = 1.0
-                if qty <= 0 or price_fx < 0 or fx <= 0:
-                    raise ValueError("수량/단가/환율을 확인하세요.")
+                kind = str(row.get("거래유형") or "").strip()
+                if "배당" in kind:
+                    skipped_div += 1
+                    continue
+                # 해외매수/매도 및 '매수'/'매도' 포함 표기 허용
+                side = normalize_side(kind)
+                if qty <= 0 or price_fx < 0:
+                    raise ValueError(f"수량/단가를 확인하세요. (수량={qty}, 단가={price_fx})")
 
                 stock = storage.get_or_create_stock(
                     ticker, name, business_id=bid, market=MARKET_OVERSEAS
+                )
+                broker_raw = str(row.get("증권사") or "").strip()
+                src_tag = str(st.session_state.get("ov_broker_source") or "")
+                if "메리츠" in broker_raw or "meritz" in src_tag:
+                    source = "broker:meritz-overseas"
+                elif "KB" in broker_raw.upper() or "kb" in src_tag:
+                    source = "broker:kb-overseas"
+                else:
+                    source = "broker:mirae-overseas"
+                broker_name = broker_name_from_source(source, broker_raw) or "미지정"
+                acct = storage.get_or_create_account(
+                    broker_name, bid, market=MARKET_OVERSEAS
                 )
                 price_krw = _fx_to_krw(price_fx, fx)
                 fee_krw = _fx_to_krw(fee_fx, fx)
@@ -2335,30 +3817,96 @@ def page_broker_overseas(storage: Storage) -> None:
                         fee=fee_krw,
                         tax=tax_krw,
                         settlement_amount=settle,
-                        memo=str(row.get("메모") or "mirae-overseas"),
-                        source="broker:mirae-overseas",
+                        memo=str(row.get("메모") or "overseas-broker"),
+                        source=source,
                         currency=ccy,
                         fx_rate=fx,
                         price_fx=price_fx,
                         fee_fx=fee_fx,
                         tax_fx=tax_fx,
+                        account_id=int(acct.id) if acct.id is not None else None,
+                        account_name=acct.name,
                     )
                 )
             except Exception as exc:  # noqa: BLE001
-                errors.append(f"행 {int(idx) + 1}: {exc}")
+                errors.append(f"행 {row_label}: {exc}")
 
-        if trades:
-            storage.add_trades_bulk(trades)
-        st.success(f"{len(trades)}건 반영 완료 → {biz}")
-        if errors:
-            with st.expander(f"오류/스킵 {len(errors)}건"):
-                for e in errors:
-                    st.write(e)
-        for k in ("ov_broker_token", "ov_broker_notes", "ov_broker_df", "ov_broker_editor"):
+        if not trades:
+            err_msg = (
+                "등록 중 오류가 발생했습니다. 저장할 매수/매도 행이 없습니다. "
+                f"(미리보기 {len(to_save)}행 · 배당스킵 {skipped_div}건 · 오류 {len(errors)}건)"
+            )
+            st.error(err_msg)
+            st.toast(err_msg, icon="⚠️")
+            if errors:
+                with st.expander("오류 상세", expanded=True):
+                    for e in errors:
+                        st.write(e)
+            else:
+                st.warning(
+                    "모든 행이 배당으로 스킵되었거나 거래유형이 비어 있습니다. "
+                    "미리보기의 거래유형(해외매수/해외매도)을 확인하세요."
+                )
+            return
+
+        storage.add_trades_bulk(trades)
+        zero_fx_n = sum(1 for t in trades if float(getattr(t, "fx_rate", 0) or 0) <= 0)
+        msg = f"✅ 등록이 완료되었습니다! {len(trades)}건 반영 → {biz}"
+        if zero_fx_n:
+            msg += f" (환율 0 등록 {zero_fx_n}건 · 임의 환산 없음)"
+        if skipped_div:
+            msg += f" · 배당스킵 {skipped_div}건"
+
+        # rerun 이후에도 보이도록 세션에 남김 (즉시 success는 rerun에 가려짐)
+        st.session_state["_ov_broker_flash"] = {
+            "level": "success",
+            "message": msg,
+            "detail": errors if errors else None,
+        }
+        st.session_state["_pending_toast"] = msg
+
+        for k in (
+            "ov_broker_token",
+            "ov_broker_notes",
+            "ov_broker_df",
+            "ov_broker_source",
+            "ov_broker_editor_ver",
+            "ov_broker_apply_snapshot",
+            "ov_broker_do_apply",
+            "ov_broker_apply_pending",
+        ):
             st.session_state.pop(k, None)
+        # 버전 키 기반 에디터·업로더 위젯 상태 정리 (새 파일 업로드 가능)
+        for k in list(st.session_state.keys()):
+            if str(k).startswith("ov_broker_editor") or str(k).startswith("ov_broker_up_"):
+                st.session_state.pop(k, None)
+        st.session_state["ov_broker_up_ver"] = (
+            int(st.session_state.get("ov_broker_up_ver") or 0) + 1
+        )
         st.rerun()
     except Exception as exc:  # noqa: BLE001
-        st.error(str(exc))
+        import traceback
+
+        err_msg = (
+            "등록 중 오류가 발생했습니다. 다시 시도해 주세요.\n"
+            f"원인: {exc}"
+        )
+        st.error(err_msg)
+        st.toast("등록 중 오류가 발생했습니다. 다시 시도해 주세요.", icon="❌")
+        st.session_state["_ov_broker_flash"] = {
+            "level": "error",
+            "message": err_msg,
+            "detail": traceback.format_exc(),
+        }
+        with st.expander("예외 상세", expanded=True):
+            st.code(traceback.format_exc())
+        # 실패 시에도 등록 플래그만 정리 (미리보기는 유지)
+        for k in (
+            "ov_broker_do_apply",
+            "ov_broker_apply_pending",
+            "ov_broker_apply_snapshot",
+        ):
+            st.session_state.pop(k, None)
 
 
 def page_broker(
@@ -2372,8 +3920,9 @@ def page_broker(
         return
     st.subheader("증권사 거래내역 변환기")
     st.caption(
-        "키움 / 미래에셋 / DB금융투자 / 한국투자 등 CSV·Excel·PDF 거래내역을 변환한 뒤, "
-        "검수·수정 후 매매일지에 반영합니다."
+        "파일을 올리면 컬럼 구조로 증권사를 자동 인식합니다. "
+        "지원: 키움 / 미래에셋 / DB금융투자 / 한국투자(PDF) 등. "
+        "인식되지 않을 때만 증권사를 선택하세요."
     )
 
     businesses = storage.list_businesses()
@@ -2391,17 +3940,31 @@ def page_broker(
                 default_idx = i
                 break
 
-    c1, c2 = st.columns(2)
-    with c1:
-        biz = st.selectbox("반영할 사업자", biz_names, index=default_idx)
-    with c2:
-        broker = st.selectbox("증권사", ["자동 감지", *list_brokers()])
+    biz = st.selectbox("반영할 사업자", biz_names, index=default_idx)
+
+    need_manual = bool(st.session_state.get("broker_need_manual"))
+    broker = "자동 감지"
+    if need_manual:
+        broker = st.selectbox(
+            "증권사 (자동 인식 실패 — 선택 필요)",
+            ["자동 감지", *list_brokers()],
+            key="broker_manual_select",
+            help="양식을 자동으로 찾지 못했습니다. 증권사를 고른 뒤 같은 파일을 다시 올려 주세요.",
+        )
+    else:
+        with st.expander("증권사 수동 지정 (선택)", expanded=False):
+            broker = st.selectbox(
+                "증권사",
+                ["자동 감지", *list_brokers()],
+                key="broker_optional_select",
+                help="자동 인식이 틀리면 여기서 지정할 수 있습니다.",
+            )
 
     up = st.file_uploader(
         "증권사 거래내역 업로드",
         type=["csv", "xlsx", "xls", "pdf"],
         key="broker_up",
-        help="CSV, Excel, PDF 거래내역/체결내역을 업로드하세요.",
+        help="파일만 올리면 증권사를 자동 판별합니다.",
     )
 
     if up:
@@ -2423,7 +3986,17 @@ def page_broker(
                     default_business=biz,
                     broker_hint=broker,
                 )
+                st.session_state.broker_need_manual = False
                 edited = result.dataframe.copy()
+                if "거래유형" in edited.columns:
+                    kind = edited["거래유형"].astype(str)
+                    drop_div = kind.str.contains("배당", na=False)
+                    n_div = int(drop_div.sum())
+                    if n_div:
+                        edited = edited.loc[~drop_div].reset_index(drop=True)
+                        result.notes.append(
+                            f"배당 {n_div}건은 증권사 변환기에서 제외했습니다."
+                        )
                 # 0건이거나 컬럼만 있는 경우 → 수동 입력용 빈 행 5개
                 if edited.empty or (
                     "수량" in edited.columns
@@ -2439,18 +4012,24 @@ def page_broker(
                 st.session_state.broker_parse_name = result.broker_name
                 st.session_state.broker_edit_df = edited
             except Exception as exc:  # noqa: BLE001
+                st.session_state.broker_need_manual = True
+                st.session_state.pop("broker_parse_token", None)
                 st.error(str(exc))
+                st.warning("아래에서 증권사를 선택한 뒤, 동일 파일을 다시 업로드해 주세요.")
                 return
 
     if "broker_edit_df" not in st.session_state:
-        st.info("변환할 CSV / Excel / PDF 파일을 업로드하세요.")
+        st.info("변환할 CSV / Excel / PDF 파일을 업로드하세요. 증권사는 자동으로 인식됩니다.")
         return
 
     for note in st.session_state.get("broker_parse_notes", []):
-        if OCR_TIP in note or "이미지형 PDF" in note or "Tesseract" in note:
-            st.warning(note)
+        note_s = str(note)
+        if OCR_TIP in note_s or "이미지형 PDF" in note_s or "Tesseract" in note_s:
+            st.warning(note_s)
+        elif "양식으로 인식" in note_s:
+            st.success(note_s)
         else:
-            st.info(note)
+            st.info(note_s)
 
     st.markdown("### 파싱 및 변환 결과 (검수 및 수정)")
     st.caption(
@@ -3220,6 +4799,54 @@ def page_settings(
             )
 
 
+@st.dialog("🗑️ 이자·배당 내역 전체 삭제")
+def confirm_clear_income_records_dialog(
+    storage: Storage,
+    business_id: int,
+    business_name: str,
+) -> None:
+    """현재 선택 사업자의 이자·배당 내역 전체 삭제 확인."""
+    db = get_storage()
+    records = db.list_income_records(business_id=int(business_id))
+    st.warning(
+        f"**[{business_name}]** 사업자에 등록된 이자·배당 내역 "
+        f"**{len(records):,}건**을 모두 삭제합니다.\n\n"
+        "등록된 모든 거래 내역을 삭제하시겠습니까? 되돌릴 수 없습니다."
+    )
+    confirm = st.checkbox(
+        "위 안내를 확인했으며 전체 삭제를 진행합니다.",
+        key=f"confirm_clear_income_{business_id}",
+    )
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("취소", use_container_width=True, key="clear_income_cancel"):
+            st.rerun()
+    with c2:
+        if st.button(
+            "🗑️ 전체 삭제 실행",
+            type="primary",
+            use_container_width=True,
+            disabled=not confirm,
+            key="clear_income_confirm",
+        ):
+            try:
+                n = db.clear_income_records_for_business(int(business_id))
+                st.session_state["_pending_toast"] = (
+                    f"[{business_name}] 이자·배당 내역 {n:,}건이 삭제되었습니다."
+                )
+                for k in (
+                    "income_preview_df",
+                    "income_preview_source",
+                    "income_records_editor",
+                    "income_preview_editor",
+                    "income_upload_token",
+                ):
+                    st.session_state.pop(k, None)
+                st.rerun()
+            except Exception as exc:  # noqa: BLE001
+                st.error(str(exc))
+
+
 def page_income(storage: Storage, business_id: int | None) -> None:
     """이자·배당소득 업로드 · 조회 · 전표 다운로드 (설정은 환경설정 메뉴)."""
     st.caption(
@@ -3240,7 +4867,10 @@ def page_income(storage: Storage, business_id: int | None) -> None:
     st.markdown("##### 원천징수영수증 업로드")
     st.caption(
         "Excel 권장 컬럼: 지급일, 지급액, 법인세, 지방소득세, 금융상품명, 증권사, 소득구분. "
-        "PDF는 자동 추정 후 표에서 수정하세요."
+        "KB증권 증권계좌 과세내역조회(원천징수영수증) 엑셀(원거래일자·과세표준)도 지원합니다. "
+        "PDF는 KB 계좌별과세내역, 미래에셋 원천징수영수증(원화), "
+        "미래에셋 거래실적증명서(배당·예탁금이용료)를 지원합니다. "
+        "파일만 올리면 양식을 자동 인식합니다. 미리보기에서 수정 후 저장하세요."
     )
     uploaded = st.file_uploader(
         "PDF / Excel / CSV",
@@ -3248,16 +4878,32 @@ def page_income(storage: Storage, business_id: int | None) -> None:
         key="income_uploader",
     )
     if uploaded is not None:
-        result = parse_income_file(uploaded.getvalue(), uploaded.name)
-        for note in result.notes:
-            st.info(note)
-        if result.rows:
-            st.session_state["income_preview_df"] = rows_to_dataframe(result.rows)
-            st.session_state["income_preview_source"] = result.source
+        token = f"{uploaded.name}:{uploaded.size}"
+        if st.session_state.get("income_upload_token") != token:
+            result = parse_income_file(uploaded.getvalue(), uploaded.name)
+            for note in result.notes:
+                st.info(note)
+            if result.rows:
+                st.session_state["income_preview_df"] = rows_to_dataframe(result.rows)
+                st.session_state["income_preview_source"] = result.source
+                st.session_state["income_upload_token"] = token
+                st.session_state.pop("income_preview_editor", None)
+            else:
+                for note in result.notes:
+                    st.warning(note)
+        else:
+            # 동일 파일 유지 중 — 이전 파싱 노트만 필요 시 생략
+            pass
 
     preview = st.session_state.get("income_preview_df")
-    if preview is not None and not preview.empty:
+    if preview is not None and not getattr(preview, "empty", True):
         st.markdown("##### 파싱 미리보기 (저장 전 수정)")
+        st.caption(
+            "환율이 0인 외화배당은 **환율** 칸에 직접 입력하세요. "
+            "입력 즉시 지급액·법인세·메모가 재계산됩니다. "
+            "(지급액 = 외화지급액 × 환율, 법인세 = 외화원천세 × 환율)"
+        )
+        preview = ensure_income_preview_columns(preview)
         edited_preview = st.data_editor(
             preview,
             use_container_width=True,
@@ -3266,8 +4912,27 @@ def page_income(storage: Storage, business_id: int | None) -> None:
             key="income_preview_editor",
             column_config={
                 "지급일": st.column_config.TextColumn("지급일", help="YYYY-MM-DD"),
-                "지급액": st.column_config.NumberColumn("지급액", format="%.0f"),
-                "법인세": st.column_config.NumberColumn("법인세", format="%.0f"),
+                "종목코드": st.column_config.TextColumn("종목코드", width="small"),
+                "통화": st.column_config.TextColumn("통화", width="small"),
+                "외화지급액": st.column_config.NumberColumn(
+                    "외화지급액", format="%.2f", help="외화 기준 지급액"
+                ),
+                "외화원천세": st.column_config.NumberColumn(
+                    "외화원천세", format="%.2f", help="외화 기준 원천세"
+                ),
+                "환율": st.column_config.NumberColumn(
+                    "환율",
+                    format="%.2f",
+                    min_value=0.0,
+                    step=0.1,
+                    help="미기재(0)인 경우 직접 입력 → 원화 자동 환산",
+                ),
+                "지급액": st.column_config.NumberColumn(
+                    "지급액(원)", format="%.0f", help="외화×환율 자동계산"
+                ),
+                "법인세": st.column_config.NumberColumn(
+                    "법인세(원)", format="%.0f", help="외화원천세×환율 자동계산"
+                ),
                 "지방소득세": st.column_config.NumberColumn(
                     "지방소득세", format="%.0f"
                 ),
@@ -3275,7 +4940,37 @@ def page_income(storage: Storage, business_id: int | None) -> None:
                     "소득구분", options=["이자", "배당"]
                 ),
             },
+            disabled=["종목코드", "통화"],
         )
+        # 환율 변경 → 지급액·법인세·메모 즉시 재계산
+        recalced = apply_income_fx_rates(edited_preview)
+        fx_changed = False
+        try:
+            prev_fx = pd.to_numeric(preview["환율"], errors="coerce").fillna(0.0).reset_index(drop=True)
+            new_fx = pd.to_numeric(recalced["환율"], errors="coerce").fillna(0.0).reset_index(drop=True)
+            prev_pay = pd.to_numeric(preview["지급액"], errors="coerce").fillna(0.0).reset_index(drop=True)
+            new_pay = pd.to_numeric(recalced["지급액"], errors="coerce").fillna(0.0).reset_index(drop=True)
+            prev_tax = pd.to_numeric(preview["법인세"], errors="coerce").fillna(0.0).reset_index(drop=True)
+            new_tax = pd.to_numeric(recalced["법인세"], errors="coerce").fillna(0.0).reset_index(drop=True)
+            has_fx_rows = bool(
+                (pd.to_numeric(recalced["외화지급액"], errors="coerce").fillna(0) > 0).any()
+            )
+            if has_fx_rows and len(prev_fx) == len(new_fx):
+                if (
+                    not prev_fx.equals(new_fx)
+                    or not prev_pay.equals(new_pay)
+                    or not prev_tax.equals(new_tax)
+                ):
+                    fx_changed = True
+        except Exception:  # noqa: BLE001
+            fx_changed = False
+
+        st.session_state["income_preview_df"] = recalced
+        if fx_changed:
+            st.session_state.pop("income_preview_editor", None)
+            st.rerun()
+
+        edited_preview = recalced
         c_save, c_clear = st.columns(2)
         if c_save.button(
             "💾 미리보기 내역 DB 저장",
@@ -3285,10 +4980,17 @@ def page_income(storage: Storage, business_id: int | None) -> None:
         ):
             try:
                 src = st.session_state.get("income_preview_source", "excel")
+                to_save = apply_income_fx_rates(edited_preview)
                 n = 0
-                for _, row in edited_preview.iterrows():
+                skipped_fx = 0
+                for _, row in to_save.iterrows():
                     pay = str(row.get("지급일") or "").strip()[:10]
                     gross = float(row.get("지급액") or 0)
+                    amt_fx = float(row.get("외화지급액") or 0)
+                    fx = float(row.get("환율") or 0)
+                    if amt_fx > 0 and fx <= 0:
+                        skipped_fx += 1
+                        continue
                     if not pay or gross <= 0:
                         continue
                     itype = (
@@ -3310,7 +5012,11 @@ def page_income(storage: Storage, business_id: int | None) -> None:
                     )
                     n += 1
                 st.session_state.pop("income_preview_df", None)
+                st.session_state.pop("income_preview_editor", None)
+                st.session_state.pop("income_upload_token", None)
                 msg = f"{n}건의 이자·배당 내역을 저장했습니다."
+                if skipped_fx:
+                    msg += f" (환율 미입력 외화 {skipped_fx}건 제외)"
                 st.session_state["_pending_toast"] = msg
                 st.toast(msg)
                 st.rerun()
@@ -3318,11 +5024,27 @@ def page_income(storage: Storage, business_id: int | None) -> None:
                 st.error(str(exc))
         if c_clear.button("미리보기 지우기", use_container_width=True):
             st.session_state.pop("income_preview_df", None)
+            st.session_state.pop("income_preview_editor", None)
+            st.session_state.pop("income_upload_token", None)
             st.rerun()
 
     st.divider()
-    st.markdown("##### 등록된 내역")
+    head_l, head_r = st.columns([3, 1])
+    with head_l:
+        st.markdown("##### 등록된 내역")
     records = storage.list_income_records(business_id=business_id)
+    with head_r:
+        if st.button(
+            "🗑️ 전체 삭제",
+            use_container_width=True,
+            type="secondary",
+            disabled=not records,
+            key="income_clear_all",
+            help="현재 사업자의 이자·배당 내역을 모두 삭제합니다",
+        ):
+            confirm_clear_income_records_dialog(
+                storage, int(business_id), company_name or str(business_id)
+            )
     if records:
         rec_df = pd.DataFrame(
             [
@@ -3528,30 +5250,78 @@ def page_income(storage: Storage, business_id: int | None) -> None:
 
 
 def main() -> None:
+    from src.supabase_client import is_transient_network_error, reset_supabase_client
+
     init_session_state()
     inject_sidebar_styles()
-    storage = get_storage()
+
+    try:
+        storage = get_storage()
+    except Exception as exc:  # noqa: BLE001
+        st.error("데이터베이스에 연결할 수 없습니다.")
+        st.caption(str(exc))
+        if st.button("🔄 연결 다시 시도", type="primary"):
+            reset_supabase_client()
+            try:
+                _storage_singleton.clear()
+            except Exception:  # noqa: BLE001
+                pass
+            st.rerun()
+        return
+
+    # 12시간마다 자동 로컬 백업 (세션당 1회만 시도)
+    if not st.session_state.get("_auto_backup_checked"):
+        st.session_state._auto_backup_checked = True
+        try:
+            from src.backup import maybe_auto_backup
+
+            auto = maybe_auto_backup()
+            if auto is not None:
+                st.session_state._pending_toast = (
+                    f"자동 백업 완료 · {auto.total_rows:,}행"
+                )
+        except Exception:  # noqa: BLE001
+            pass
 
     pending_toast = st.session_state.pop("_pending_toast", None)
     if pending_toast:
         st.toast(pending_toast)
 
-    # 사이드바: 사업자(+데이터 관리) → 트리형 메뉴
-    business_id = sidebar_business_selector(storage)
-    st.sidebar.divider()
-    menu = sidebar_tree_menu()
-    st.sidebar.divider()
-    st.sidebar.caption(f"DB: {storage.db_path}")
+    try:
+        # 사이드바: 사업자(+데이터 관리) → 트리형 메뉴
+        business_id = sidebar_business_selector(storage)
+        st.sidebar.divider()
+        menu = sidebar_tree_menu()
+        st.sidebar.divider()
+        st.sidebar.caption(f"DB: {storage.db_path}")
 
-    # F5 복원용 URL 동기화 (사업자·메뉴·시장)
-    sync_url_params()
+        # F5 복원용 URL 동기화 (사업자·메뉴·시장)
+        sync_url_params()
 
-    title, caption = MENU_PAGE_META.get(
-        menu, MENU_PAGE_META["domestic_dashboard"]
-    )
-    st.title(title)
-    st.caption(caption)
-    route_active_menu(storage, business_id, menu)
+        title, caption = MENU_PAGE_META.get(
+            menu, MENU_PAGE_META["domestic_dashboard"]
+        )
+        st.title(title)
+        if caption:
+            st.caption(caption)
+        route_active_menu(storage, business_id, menu)
+    except Exception as exc:  # noqa: BLE001
+        if is_transient_network_error(exc) or "데이터베이스 연결에 실패" in str(exc):
+            st.error(
+                "데이터베이스 연결이 일시적으로 끊겼습니다. "
+                "네트워크 상태를 확인한 뒤 다시 시도해 주세요."
+            )
+            with st.expander("오류 상세"):
+                st.code(str(exc))
+            if st.button("🔄 다시 연결", type="primary", key="db_reconnect"):
+                reset_supabase_client()
+                try:
+                    _storage_singleton.clear()
+                except Exception:  # noqa: BLE001
+                    pass
+                st.rerun()
+            return
+        raise
 
 
 if __name__ == "__main__":

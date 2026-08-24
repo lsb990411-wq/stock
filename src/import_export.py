@@ -7,7 +7,7 @@ from typing import Any
 
 import pandas as pd
 
-from .models import Trade, normalize_side, now_str
+from .models import Trade, coerce_fx_rate, normalize_currency, normalize_side, now_str
 from .storage import Storage
 
 # 표준 매매일지 컬럼 (한글 헤더)
@@ -37,7 +37,53 @@ COLUMN_ALIASES = {
     "제세금": ["제세금", "세금", "거래세", "제세", "tax"],
     "정산금액": ["정산금액", "결제금액", "거래금액", "금액", "settlement", "amount"],
     "메모": ["메모", "비고", "적요", "memo", "note"],
+    "환율": ["환율", "적용환율", "적용 환율", "fx_rate", "exchange_rate"],
+    "통화": ["통화", "통화코드", "currency", "ccy"],
+    "외화단가": ["외화단가", "외화가격", "price_fx"],
+    "외화수수료": ["외화수수료", "fee_fx"],
+    "외화제세금": ["외화제세금", "tax_fx"],
+    "증권사": ["증권사", "증권회사", "금융기관", "broker", "broker_name", "거래처"],
 }
+
+
+def broker_name_from_source(source: str = "", fallback: str = "") -> str:
+    """source/증권사 문자열에서 표시용 증권사명 추출."""
+    text = (fallback or "").strip()
+    if text and text.lower() not in {"nan", "none"}:
+        return text
+    src = (source or "").strip()
+    if src.startswith("broker:"):
+        name = src.split(":", 1)[1].strip()
+        # mirae-overseas → 미래에셋증권 등 정규화
+        lower = name.lower()
+        mapping = {
+            "mirae-overseas": "미래에셋증권",
+            "mirae": "미래에셋증권",
+            "miraeasset": "미래에셋증권",
+            "kb-overseas": "KB증권",
+            "kb": "KB증권",
+            "meritz-overseas": "메리츠증권",
+            "meritz": "메리츠증권",
+            "kiwoom": "키움증권",
+            "db": "DB금융투자",
+            "db금융투자": "DB금융투자",
+        }
+        if lower in mapping:
+            return mapping[lower]
+        if "미래에셋" in name or "mirae" in lower:
+            return "미래에셋증권"
+        if "kb" in lower or "KB" in name:
+            return "KB증권"
+        if "메리츠" in name or "meritz" in lower:
+            return "메리츠증권"
+        if "키움" in name or "kiwoom" in lower:
+            return "키움증권"
+        if "DB" in name.upper() or "디비" in name:
+            return "DB금융투자"
+        return name
+    if src in {"manual", "manual-overseas", "csv", "legacy_journal"}:
+        return ""
+    return src
 
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -162,8 +208,49 @@ def dataframe_to_trades(
                 settlement = _to_float(row.get("정산금액"))
             memo = str(row.get("메모", "") or "").strip()
 
+            # 환율: 비어 있으면 추정하지 않고 0 등록
+            fx_raw = row.get("환율") if "환율" in work.columns else None
+            if fx_raw is None and "적용환율" in work.columns:
+                fx_raw = row.get("적용환율")
+            fx_rate = coerce_fx_rate(fx_raw)
+            price_fx = (
+                _to_float(row.get("외화단가", 0))
+                if "외화단가" in work.columns
+                else 0.0
+            )
+            fee_fx = (
+                _to_float(row.get("외화수수료", 0))
+                if "외화수수료" in work.columns
+                else 0.0
+            )
+            tax_fx = (
+                _to_float(row.get("외화제세금", 0))
+                if "외화제세금" in work.columns
+                else 0.0
+            )
+            currency = "KRW"
+            if "통화" in work.columns:
+                currency = normalize_currency(str(row.get("통화") or "KRW"))
+            elif "통화코드" in work.columns:
+                currency = normalize_currency(str(row.get("통화코드") or "KRW"))
+
             if qty <= 0:
                 raise ValueError("수량은 0보다 커야 합니다.")
+
+            broker_raw = ""
+            if "증권사" in work.columns:
+                broker_raw = str(row.get("증권사") or "").strip()
+            broker_name = broker_name_from_source(source, broker_raw)
+            account_id = None
+            account_name = ""
+            if broker_name:
+                acct = storage.get_or_create_account(
+                    broker_name,
+                    int(business.id),  # type: ignore[arg-type]
+                    market=mkt,
+                )
+                account_id = int(acct.id) if acct.id is not None else None
+                account_name = acct.name
 
             trades.append(
                 Trade(
@@ -183,6 +270,13 @@ def dataframe_to_trades(
                     business_name=business.name,
                     stock_code=stock.code,
                     stock_name=stock.name,
+                    currency=currency,
+                    fx_rate=fx_rate,
+                    price_fx=price_fx,
+                    fee_fx=fee_fx,
+                    tax_fx=tax_fx,
+                    account_id=account_id,
+                    account_name=account_name,
                 )
             )
         except Exception as exc:  # noqa: BLE001 - row-level collect
@@ -224,6 +318,7 @@ def trades_to_dataframe(trades: list[Trade]) -> pd.DataFrame:
             {
                 "거래일자": t.trade_date,
                 "사업자": t.business_name,
+                "증권사": getattr(t, "account_name", "") or "",
                 "종목코드": t.stock_code,
                 "종목명": t.stock_name,
                 "거래유형": side_label,
@@ -251,6 +346,7 @@ def trades_to_dataframe(trades: list[Trade]) -> pd.DataFrame:
     display_cols = [
         "거래일자",
         "사업자",
+        "증권사",
         "종목코드",
         "종목명",
         "거래유형",
@@ -264,13 +360,14 @@ def trades_to_dataframe(trades: list[Trade]) -> pd.DataFrame:
         "출처",
         "ID",
     ]
-    # 외화 메타는 값 있을 때만 붙임
+    # 외화 메타 포함 (해외주식 상세용)
     df = pd.DataFrame(rows)
     if df.empty:
-        return pd.DataFrame(columns=display_cols)
+        return pd.DataFrame(
+            columns=display_cols + ["통화", "환율", "외화단가"]
+        )
     extra = [c for c in ("통화", "환율", "외화단가") if c in df.columns]
-    ordered = [c for c in display_cols if c in df.columns]
-    # 정산금액 앞에 외화 정보가 있으면 삽입하지 않고 뒤에 유지하지 않음 — display에만 원가 포함
+    ordered = [c for c in display_cols if c in df.columns] + extra
     return df.loc[:, ordered]
 
 
@@ -282,6 +379,7 @@ def positions_to_dataframe(positions) -> pd.DataFrame:
         rows.append(
             {
                 "사업자": p.business_name,
+                "증권사": getattr(p, "account_name", "") or "미지정",
                 "종목코드": p.stock_code,
                 "종목명": p.stock_name,
                 "잔여수량": p.quantity,
@@ -300,12 +398,17 @@ def sell_results_to_dataframe(sell_results) -> pd.DataFrame:
             {
                 "거래일자": s.trade_date,
                 "사업자": s.business_name,
+                "증권사": getattr(s, "account_name", "") or "미지정",
                 "종목코드": s.stock_code,
                 "종목명": s.stock_name,
                 "매도수량": s.quantity,
                 "매도단가": s.price,
                 "수수료": s.fee,
-                "실현손익": round(s.realized_pnl, 2),
+                "매수원가": round(getattr(s, "book_cost", 0.0) or 0.0, 2),
+                "처분손익": round(
+                    getattr(s, "disposal_pnl", s.realized_pnl) or 0.0, 2
+                ),
+                "FIFO실현손익": round(s.realized_pnl, 2),
                 "부족수량": s.shortfall_qty,
                 "매칭건수": len(s.matches),
             }
@@ -317,12 +420,35 @@ def export_to_excel_bytes(
     trades_df: pd.DataFrame,
     positions_df: pd.DataFrame,
     sells_df: pd.DataFrame,
+    *,
+    text_columns: list[str] | None = None,
 ) -> bytes:
+    """거래/잔고/실현손익 시트를 담은 xlsx bytes.
+
+    text_columns: 적요·메모처럼 공백 패딩을 유지해야 하는 텍스트 열.
+    """
     bio = io.BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
         trades_df.to_excel(writer, sheet_name="거래내역", index=False)
         positions_df.to_excel(writer, sheet_name="보유잔고", index=False)
         sells_df.to_excel(writer, sheet_name="실현손익", index=False)
+        if text_columns and "거래내역" in writer.sheets:
+            ws = writer.sheets["거래내역"]
+            headers = {
+                cell.value: idx
+                for idx, cell in enumerate(ws[1], start=1)
+                if cell.value is not None
+            }
+            for col_name in text_columns:
+                col_idx = headers.get(col_name)
+                if not col_idx:
+                    continue
+                for row in range(2, ws.max_row + 1):
+                    cell = ws.cell(row=row, column=col_idx)
+                    if cell.value is None:
+                        continue
+                    cell.number_format = "@"
+                    cell.value = str(cell.value)
     return bio.getvalue()
 
 
