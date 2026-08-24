@@ -1,0 +1,26 @@
+# 로컬/민감/대용량 — 컨테이너 빌드 제외
+.git
+.venv
+venv
+env
+__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.idea
+.vscode
+
+.streamlit/secrets.toml
+.env
+.env.*
+
+data/backups/
+data/_migrate/
+data/_migrate_fresh/
+data/*.db-wal
+data/*.db-shm
+
+*.pdf
+*.log
+terminals/

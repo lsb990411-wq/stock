@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -29,6 +30,15 @@ BACKUP_TABLES = (
 _PAGE = 1000
 _KEEP_SNAPSHOTS = 30  # 타임스탬프 폴더 최대 개수
 _AUTO_MIN_HOURS = 12
+
+
+def is_ephemeral_host() -> bool:
+    """Vercel/Streamlit Cloud 등 로컬 디스크가 휘발적인 환경."""
+    return bool(
+        os.environ.get("VERCEL")
+        or os.environ.get("VERCEL_ENV")
+        or os.environ.get("STREAMLIT_SERVER_ENV") == "cloud"
+    )
 
 
 @dataclass
@@ -85,6 +95,11 @@ def _prune_old_snapshots(keep: int = _KEEP_SNAPSHOTS) -> None:
 
 def create_backup(*, label: str = "") -> BackupResult:
     """전체 테이블을 data/backups/<timestamp>/ 와 latest/ 에 저장."""
+    if is_ephemeral_host():
+        raise RuntimeError(
+            "Vercel/클라우드 환경에서는 로컬 JSON 백업을 저장할 수 없습니다. "
+            "Supabase 대시보드 백업 또는 로컬 PC에서 백업하세요."
+        )
     client = get_supabase_client()
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     if label.strip():
@@ -151,6 +166,8 @@ def latest_backup_time() -> datetime | None:
 
 def maybe_auto_backup(*, min_hours: float = _AUTO_MIN_HOURS) -> BackupResult | None:
     """마지막 백업이 min_hours 이상 지났으면 자동 백업."""
+    if is_ephemeral_host():
+        return None
     last = latest_backup_time()
     if last is not None and datetime.now() - last < timedelta(hours=min_hours):
         return None

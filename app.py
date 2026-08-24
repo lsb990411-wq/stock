@@ -2224,31 +2224,34 @@ def sidebar_data_management(
     business_id: int | None,
 ) -> None:
     """사이드바 데이터 관리 — 로컬 백업 · 선택 사업자 거래 삭제."""
-    from src.backup import BACKUP_ROOT, create_backup, latest_backup_time
+    from src.backup import BACKUP_ROOT, create_backup, is_ephemeral_host, latest_backup_time
 
     st.sidebar.markdown("---")
     st.sidebar.subheader("데이터 관리")
 
-    last_bt = latest_backup_time()
-    if last_bt is None:
-        st.sidebar.caption("로컬 백업: 없음")
+    if is_ephemeral_host():
+        st.sidebar.caption("클라우드 배포 — 로컬 백업은 PC에서 실행하세요.")
     else:
-        st.sidebar.caption(f"로컬 백업: {last_bt.strftime('%Y-%m-%d %H:%M')}")
+        last_bt = latest_backup_time()
+        if last_bt is None:
+            st.sidebar.caption("로컬 백업: 없음")
+        else:
+            st.sidebar.caption(f"로컬 백업: {last_bt.strftime('%Y-%m-%d %H:%M')}")
 
-    if st.sidebar.button(
-        "💾 지금 로컬 백업",
-        use_container_width=True,
-        key="sidebar_backup_now",
-        help=f"Supabase 전체를 {BACKUP_ROOT} 에 JSON으로 저장",
-    ):
-        try:
-            result = create_backup(label="manual")
-            st.session_state._pending_toast = (
-                f"백업 완료 · {result.total_rows:,}행 → {result.path.name}"
-            )
-            st.rerun()
-        except Exception as exc:  # noqa: BLE001
-            st.sidebar.error(f"백업 실패: {exc}")
+        if st.sidebar.button(
+            "💾 지금 로컬 백업",
+            use_container_width=True,
+            key="sidebar_backup_now",
+            help=f"Supabase 전체를 {BACKUP_ROOT} 에 JSON으로 저장",
+        ):
+            try:
+                result = create_backup(label="manual")
+                st.session_state._pending_toast = (
+                    f"백업 완료 · {result.total_rows:,}행 → {result.path.name}"
+                )
+                st.rerun()
+            except Exception as exc:  # noqa: BLE001
+                st.sidebar.error(f"백업 실패: {exc}")
 
     if business_id is None:
         st.sidebar.caption("사업자를 선택하면 해당 사업자의 거래만 삭제할 수 있습니다.")

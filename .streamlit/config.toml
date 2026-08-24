@@ -1,3 +1,9 @@
 [client]
 toolbarMode = "minimal"
 showErrorDetails = true
+
+[server]
+headless = true
+enableCORS = false
+enableXsrfProtection = false
+fileWatcherType = "none"
