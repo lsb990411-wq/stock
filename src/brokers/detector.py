@@ -61,22 +61,51 @@ def _load_tabular_candidates(
     last_exc: Exception | None = None
     candidates: list[pd.DataFrame] = []
 
-    if ext in {"csv", "xlsx", "xls"}:
-        try:
-            candidates.append(read_tabular(file_bytes, filename))
-        except Exception as exc:  # noqa: BLE001
-            last_exc = exc
+    if ext not in {"csv", "xlsx", "xls"}:
+        return candidates, last_exc
 
-        if ext in {"xlsx", "xls"}:
-            import io
+    try:
+        candidates.append(read_tabular(file_bytes, filename))
+    except Exception as exc:  # noqa: BLE001
+        last_exc = exc
 
-            for header in range(0, 8):
+    if ext not in {"xlsx", "xls"}:
+        return candidates, last_exc
+
+    import io as _io
+
+    # 한 번만 읽어 raw DataFrame을 얻은 뒤, 첫 8행을 헤더 후보로 탐색
+    try:
+        raw = pd.read_excel(
+            _io.BytesIO(file_bytes),
+            header=None,
+            dtype=str,                # 타입 추론 생략으로 읽기 속도 향상
+            engine="xlrd" if ext == "xls" else "openpyxl",
+        )
+        if len(raw.columns) >= 4:
+            # header=0 버전은 이미 read_tabular가 포함했으므로 1행부터 시도
+            for h in range(1, min(8, len(raw))):
+                row_vals = raw.iloc[h].fillna("").astype(str).tolist()
+                # 한글이나 영문 컬럼명이 2개 이상 있는 행만 헤더로 인정
+                meaningful = sum(
+                    1 for v in row_vals
+                    if len(v.strip()) >= 2 and not v.strip().replace(".", "").replace(",", "").isdigit()
+                )
+                if meaningful < 2:
+                    continue
                 try:
-                    df = pd.read_excel(io.BytesIO(file_bytes), header=header)
-                    if len(df.columns) >= 4:
+                    df = raw.iloc[h + 1 :].copy()
+                    df.columns = row_vals
+                    df = df.reset_index(drop=True)
+                    # 완전 빈 행 제거
+                    df = df.loc[~df.apply(lambda r: r.str.strip().eq("").all(), axis=1)]
+                    if len(df.columns) >= 4 and not df.empty:
                         candidates.append(df)
                 except Exception:  # noqa: BLE001
                     continue
+    except Exception as exc:  # noqa: BLE001
+        last_exc = last_exc or exc
+
     return candidates, last_exc
 
 

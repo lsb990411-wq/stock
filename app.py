@@ -27,9 +27,6 @@ if str(ROOT) not in sys.path:
 from src.brokers.pdf_parser import OCR_TIP, empty_trade_rows
 from src.legacy_journal import parse_legacy_journal_excel
 
-# Streamlit 핫리로드 시 stale sys.modules 방지
-import importlib
-
 import src.brokers as _brokers_mod
 import src.brokers.detector as _brokers_detector_mod
 import src.brokers.identify as _brokers_identify_mod
@@ -44,20 +41,28 @@ import src.income_parser as _income_parser_mod
 import src.income_voucher as _income_voucher_mod
 import src.import_export as _import_export_mod
 
-# 하위 모듈부터 리로드 (detector가 kb/meritz를 참조)
-_brokers_identify_mod = importlib.reload(_brokers_identify_mod)
-_kb_overseas_mod = importlib.reload(_kb_overseas_mod)
-_meritz_overseas_mod = importlib.reload(_meritz_overseas_mod)
-_mirae_overseas_mod = importlib.reload(_mirae_overseas_mod)
-_brokers_detector_mod = importlib.reload(_brokers_detector_mod)
-_brokers_mod = importlib.reload(_brokers_mod)
-_models_mod = importlib.reload(_models_mod)
-_storage_mod = importlib.reload(_storage_mod)
-_fifo_mod = importlib.reload(_fifo_mod)
-_voucher_mod = importlib.reload(_voucher_mod)
-_income_parser_mod = importlib.reload(_income_parser_mod)
-_income_voucher_mod = importlib.reload(_income_voucher_mod)
-_import_export_mod = importlib.reload(_import_export_mod)
+# 로컬 개발 시 핫리로드 지원 — 클라우드/컨테이너 환경에선 매 렌더링 오버헤드 방지를 위해 스킵
+import os as _os
+_IS_LOCAL_DEV = not (
+    _os.environ.get("VERCEL")
+    or _os.environ.get("VERCEL_ENV")
+    or _os.environ.get("STREAMLIT_SERVER_ENV") == "cloud"
+)
+if _IS_LOCAL_DEV:
+    import importlib
+    _brokers_identify_mod = importlib.reload(_brokers_identify_mod)
+    _kb_overseas_mod = importlib.reload(_kb_overseas_mod)
+    _meritz_overseas_mod = importlib.reload(_meritz_overseas_mod)
+    _mirae_overseas_mod = importlib.reload(_mirae_overseas_mod)
+    _brokers_detector_mod = importlib.reload(_brokers_detector_mod)
+    _brokers_mod = importlib.reload(_brokers_mod)
+    _models_mod = importlib.reload(_models_mod)
+    _storage_mod = importlib.reload(_storage_mod)
+    _fifo_mod = importlib.reload(_fifo_mod)
+    _voucher_mod = importlib.reload(_voucher_mod)
+    _income_parser_mod = importlib.reload(_income_parser_mod)
+    _income_voucher_mod = importlib.reload(_income_voucher_mod)
+    _import_export_mod = importlib.reload(_import_export_mod)
 
 detect_and_parse = _brokers_mod.detect_and_parse
 detect_and_parse_overseas = _brokers_mod.detect_and_parse_overseas
@@ -3550,10 +3555,11 @@ def page_broker_overseas(storage: Storage) -> None:
         if st.session_state.get("ov_broker_token") != token:
             name = up.name or ""
             file_bytes = up.getvalue()
-            if need_manual and broker_hint != "자동 감지":
-                result = parse_overseas_with_hint(file_bytes, name, broker_hint)
-            else:
-                result = detect_and_parse_overseas(file_bytes, name)
+            with st.spinner("파일을 분석하고 있습니다..."):
+                if need_manual and broker_hint != "자동 감지":
+                    result = parse_overseas_with_hint(file_bytes, name, broker_hint)
+                else:
+                    result = detect_and_parse_overseas(file_bytes, name)
 
             identified = bool(result.get("identified")) and bool(result.get("rows"))
             # 인식은 됐지만 0건이면 미리보기는 비움 — 오판(예: 메리츠) 방지
@@ -3983,37 +3989,38 @@ def page_broker(
                         return
                     file_ext = "pdf"
 
-                result = detect_and_parse(
-                    up.getvalue(),
-                    up.name if file_ext != "pdf" or up.name.lower().endswith(".pdf") else f"{up.name}.pdf",
-                    default_business=biz,
-                    broker_hint=broker,
-                )
-                st.session_state.broker_need_manual = False
-                edited = result.dataframe.copy()
-                if "거래유형" in edited.columns:
-                    kind = edited["거래유형"].astype(str)
-                    drop_div = kind.str.contains("배당", na=False)
-                    n_div = int(drop_div.sum())
-                    if n_div:
-                        edited = edited.loc[~drop_div].reset_index(drop=True)
-                        result.notes.append(
-                            f"배당 {n_div}건은 증권사 변환기에서 제외했습니다."
-                        )
-                # 0건이거나 컬럼만 있는 경우 → 수동 입력용 빈 행 5개
-                if edited.empty or (
-                    "수량" in edited.columns
-                    and edited["수량"].isna().all()
-                    and edited.get("종목명", pd.Series(dtype=str)).astype(str).str.strip().eq("").all()
-                ):
-                    if edited.empty or len(edited) < 5:
-                        edited = empty_trade_rows(biz, n=5)
-                if "사업자" in edited.columns:
-                    edited["사업자"] = edited["사업자"].fillna(biz).replace("", biz)
-                st.session_state.broker_parse_token = file_token
-                st.session_state.broker_parse_notes = result.notes
-                st.session_state.broker_parse_name = result.broker_name
-                st.session_state.broker_edit_df = edited
+                with st.spinner("파일을 분석 중입니다..."):
+                    result = detect_and_parse(
+                        up.getvalue(),
+                        up.name if file_ext != "pdf" or up.name.lower().endswith(".pdf") else f"{up.name}.pdf",
+                        default_business=biz,
+                        broker_hint=broker,
+                    )
+                    st.session_state.broker_need_manual = False
+                    edited = result.dataframe.copy()
+                    if "거래유형" in edited.columns:
+                        kind = edited["거래유형"].astype(str)
+                        drop_div = kind.str.contains("배당", na=False)
+                        n_div = int(drop_div.sum())
+                        if n_div:
+                            edited = edited.loc[~drop_div].reset_index(drop=True)
+                            result.notes.append(
+                                f"배당 {n_div}건은 증권사 변환기에서 제외했습니다."
+                            )
+                    # 0건이거나 컬럼만 있는 경우 → 수동 입력용 빈 행 5개
+                    if edited.empty or (
+                        "수량" in edited.columns
+                        and edited["수량"].isna().all()
+                        and edited.get("종목명", pd.Series(dtype=str)).astype(str).str.strip().eq("").all()
+                    ):
+                        if edited.empty or len(edited) < 5:
+                            edited = empty_trade_rows(biz, n=5)
+                    if "사업자" in edited.columns:
+                        edited["사업자"] = edited["사업자"].fillna(biz).replace("", biz)
+                    st.session_state.broker_parse_token = file_token
+                    st.session_state.broker_parse_notes = result.notes
+                    st.session_state.broker_parse_name = result.broker_name
+                    st.session_state.broker_edit_df = edited
             except Exception as exc:  # noqa: BLE001
                 st.session_state.broker_need_manual = True
                 st.session_state.pop("broker_parse_token", None)
@@ -4198,9 +4205,10 @@ def page_legacy_journal(
         token = f"{up.name}:{up.size}:{biz}"
         if st.session_state.get("legacy_token") != token:
             try:
-                df, notes, stats = parse_legacy_journal_excel(
-                    up.getvalue(), default_business=biz
-                )
+                with st.spinner("엑셀을 분석 중입니다..."):
+                    df, notes, stats = parse_legacy_journal_excel(
+                        up.getvalue(), default_business=biz
+                    )
                 if "사업자" in df.columns:
                     df["사업자"] = biz
                 st.session_state.legacy_token = token
@@ -4883,7 +4891,8 @@ def page_income(storage: Storage, business_id: int | None) -> None:
     if uploaded is not None:
         token = f"{uploaded.name}:{uploaded.size}"
         if st.session_state.get("income_upload_token") != token:
-            result = parse_income_file(uploaded.getvalue(), uploaded.name)
+            with st.spinner("파일을 분석 중입니다..."):
+                result = parse_income_file(uploaded.getvalue(), uploaded.name)
             for note in result.notes:
                 st.info(note)
             if result.rows:
