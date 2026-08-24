@@ -14,6 +14,10 @@ __pycache__
 .streamlit/secrets.toml
 .env
 .env.*
+.env.local
+.vercel
+.python-version
+scripts/__pycache__/
 
 data/backups/
 data/_migrate/

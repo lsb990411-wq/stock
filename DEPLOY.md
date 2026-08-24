@@ -1,99 +1,92 @@
 # Vercel 배포 가이드
 
-법인 주식 매매일지(Streamlit)는 **장시간 실행되는 Python 프로세스**이므로, Vercel의 일반 Serverless Function(`@vercel/python`)으로는 동작하지 않습니다.  
-이 저장소는 **Vercel Container Service**(`Dockerfile.vercel`)로 배포하도록 구성되어 있습니다.
+이 앱은 **Streamlit**(상시 실행 Python 서버)입니다.  
+Vercel의 일반 Serverless Function(`@vercel/python`, Flask/FastAPI식 요청 단위 실행)으로는 WebSocket·세션이 동작하지 않습니다.
 
-## 1. 사전 준비
+배포 방식은 **Vercel Container Service** (`Dockerfile.vercel`)입니다.
 
-- GitHub 저장소: `https://github.com/lsb990411-wq/stock`
-- Supabase 프로젝트 URL · **anon public key**
-- Vercel 계정 (Container Service 지원 플랜 — 팀/Pro 등, 대시보드에서 **Framework: Services** 확인)
-
-## 2. Vercel에 프로젝트 연결
-
-1. [Vercel Dashboard](https://vercel.com/dashboard) → **Add New… → Project**
-2. GitHub `stock` 저장소 Import
-3. **Framework Preset** 이 자동 감지되지 않으면 **Other / Services** 로 설정
-4. Root Directory: `.` (저장소 루트)
-5. `vercel.json` · `Dockerfile.vercel` 이 루트에 있으면 별도 Build Command 불필요
-
-CLI로 배포할 경우:
-
-```bash
-npm i -g vercel
-vercel login
-vercel link
-vercel deploy          # Preview
-vercel deploy --prod   # Production
-```
-
-## 3. 환경 변수 (필수)
+## 환경 변수 (필수)
 
 **Vercel Dashboard → Project → Settings → Environment Variables**
 
-| 이름 | 값 | 비고 |
-|------|-----|------|
-| `SUPABASE_URL` | `https://xxxx.supabase.co` | Project Settings → API → Project URL |
-| `SUPABASE_KEY` | `eyJ...` 또는 `sb_publishable_...` | **anon public** 키 (service_role 금지) |
+| 변수명 | 예시 | 설명 |
+|--------|------|------|
+| `SUPABASE_URL` | `https://xxxx.supabase.co` | Supabase → Project Settings → API → Project URL |
+| `SUPABASE_KEY` | `eyJ...` 또는 `sb_publishable_...` | **anon / publishable** 키. `service_role` 은 넣지 마세요. |
 
-- **Production**, **Preview**, **Development** 모두 체크 후 저장
-- 재배포(Deployments → Redeploy)해야 컨테이너에 반영됩니다
-- `.streamlit/secrets.toml` 은 git에 없으며, Vercel에서는 **환경 변수만** 사용합니다
+설정 순서:
 
-`src/supabase_client.py` 는 아래 순서로 읽습니다.
+1. **Key**에 `SUPABASE_URL` 입력 → **Value**에 프로젝트 URL 붙여넣기
+2. Environment에서 **Production / Preview / Development** 모두 선택 → Save
+3. 같은 방식으로 `SUPABASE_KEY` 추가
+4. **Deployments → 최신 배포 → Redeploy** (환경 변수는 재배포 후 반영)
 
-1. `SUPABASE_URL` / `SUPABASE_KEY` (또는 `SUPABASE_ANON_KEY`)
-2. 로컬 `.streamlit/secrets.toml`
-3. Streamlit secrets
+앱은 `src/supabase_client.py`에서 다음 순서로 읽습니다.
 
-로컬 개발용 템플릿: `.env.example` 참고 (Vercel에는 `.env` 파일을 올리지 마세요).
+1. `SUPABASE_URL` + `SUPABASE_KEY` (또는 `SUPABASE_ANON_KEY`)
+2. 로컬 `.streamlit/secrets.toml`의 `[supabase] url` / `key`
+3. Streamlit Cloud secrets
 
-## 4. 설정 파일 요약
+로컬 템플릿: `.env.example` (git에는 실제 키를 올리지 마세요).
+
+## 왜 서버리스 JSON만으로는 안 되는가
+
+아래 같은 설정은 Flask/FastAPI용이며 Streamlit과 맞지 않습니다.
+
+```json
+{ "builds": [{ "src": "app.py", "use": "@vercel/python" }] }
+```
+
+`streamlit run`은 장시간 프로세스이므로 `vercel.json`의 **services + container + `root`** 가 필요합니다.  
+이전 배포 실패(`missing required property root`)는 `root` 누락 때문이었습니다.
+
+## 배포 방법
+
+대시보드:
+
+1. [vercel.com](https://vercel.com/new) → GitHub `lsb990411-wq/stock` Import
+2. Framework: **Other** / **Services**
+3. Root Directory: `.`
+4. 위 환경 변수 등록 후 Deploy
+
+CLI (이미 `vercel link` 된 경우):
+
+```bash
+npx vercel@latest deploy --prod --yes
+```
+
+## 파일 역할
 
 | 파일 | 역할 |
 |------|------|
-| `vercel.json` | Container Service `web` + 전 경로 rewrite |
-| `Dockerfile.vercel` | Python 3.13 + Streamlit 실행 (`$PORT`) |
-| `requirements.txt` | Python 의존성 |
-| `.python-version` | Python 3.13 |
-| `.vercelignore` | secrets·백업·PDF 등 빌드 제외 |
-| `.streamlit/config.toml` | headless / fileWatcher 비활성 |
+| `vercel.json` | Container `web` (`root: "."`) + 전 경로 rewrite |
+| `Dockerfile.vercel` | Python 3.13 + Streamlit (`$PORT`) |
+| `requirements.txt` | Python 패키지 |
+| `.python-version` | 3.13 |
+| `.vercelignore` | secrets, 백업, PDF 제외 |
+| `.streamlit/config.toml` | headless / file watcher off |
 
-## 5. 배포 후 확인
+## 의존성 참고
 
-- 배포 URL 접속 → 사이드바 **DB: supabase** 표시
-- 사업자·거래 목록이 Supabase와 일치하는지 확인
-- 업로드·전표 다운로드 등 무거운 작업은 첫 요청 시 수 초 걸릴 수 있음
+실제 코드에서 쓰는 패키지만 `requirements.txt`에 넣었습니다.
 
-## 6. 제한·주의
+- `openpyxl` / `xlrd`: 엑셀 전표·업로드
+- `pdfplumber`: PDF 파싱
+- **weasyprint는 사용하지 않습니다.** (PDF 생성은 엑셀 전표로 처리)
 
-- **로컬 JSON 백업**(`data/backups/`)은 Vercel 컨테이너 디스크에 영구 저장되지 않습니다. 앱은 클라우드에서 자동 백업을 건너뜁니다.
-- DB는 Supabase가 원본입니다. 백업은 Supabase Dashboard 또는 로컬 PC에서 실행하세요.
-- Streamlit WebSocket 특성상, 일부 프록시/캐시 설정에서 새로고침 이슈가 있을 수 있습니다.
-- OCR(PDF 스캔)은 Docker 이미지에 `tesseract-ocr` 포함. 실패 시 텍스트 PDF·Excel 업로드를 사용하세요.
+## 제한
 
-## 7. Streamlit Cloud (대안)
+- 컨테이너 디스크는 휘발성 → 클라우드에서 로컬 JSON 백업은 건너뜀
+- 데이터 원본은 Supabase
+- OCR은 이미지에 tesseract 포함
 
-Vercel Container가 어렵다면 [Streamlit Community Cloud](https://share.streamlit.io/) 가 더 단순합니다.
-
-- 같은 GitHub repo 연결
-- **Secrets** (TOML):
-
-```toml
-[supabase]
-url = "https://xxxx.supabase.co"
-key = "your_anon_key"
-```
-
-- Main file: `app.py`
-
-## 8. 문제 해결
+## 문제 해결
 
 | 증상 | 확인 |
 |------|------|
-| DB 연결 실패 | 환경 변수 이름·값, Redeploy |
-| 빌드 실패 (용량) | `.vercelignore` 에 `data/backups`, PDF 제외 확인 |
-| 빈 화면 / 502 | Deployment Logs, Container Service 활성 여부 |
-| 데이터 안 보임 | Supabase RLS·anon key 권한 |
+| `Invalid vercel.json - missing required property root` | `services.web.root` 가 `"."` 인지 |
+| DB 연결 실패 | 환경 변수 + Redeploy |
+| Schema / Container 플랜 오류 | Vercel 플랜이 Container/Services 를 지원하는지 |
+| 502 | Runtime Logs |
 
-로그: Vercel Dashboard → Deployments → 해당 배포 → **Runtime Logs**
+대안: [Streamlit Community Cloud](https://share.streamlit.io/) + secrets.toml `[supabase]`.

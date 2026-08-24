@@ -1,4 +1,6 @@
-# Vercel Container / Streamlit Cloud 공통 의존성
+# Python / Streamlit 앱 의존성
+# Vercel Container · 로컬 · Streamlit Cloud 공통
+
 streamlit>=1.61.0
 supabase>=2.31.0
 httpx>=0.28.0
@@ -8,6 +10,6 @@ openpyxl>=3.1.5
 xlrd>=2.0.2
 pdfplumber>=0.11.0
 
-# 스캔 PDF OCR (Dockerfile.vercel 에 tesseract 설치됨)
+# 스캔 PDF OCR (Dockerfile.vercel 에 tesseract 설치)
 pytesseract>=0.3.13
 Pillow>=12.0.0
