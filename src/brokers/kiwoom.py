@@ -7,10 +7,10 @@ import pandas as pd
 from .base import (
     BrokerParseResult,
     BrokerParser,
-    clean_code,
-    clean_number,
-    ensure_side,
     find_col,
+    series_clean_code,
+    series_clean_number,
+    series_ensure_side,
     to_standard_frame,
 )
 
@@ -73,54 +73,59 @@ class KiwoomParser(BrokerParser):
         if missing:
             raise ValueError(f"키움증권 파서: 필수 컬럼 인식 실패 ({', '.join(missing)})")
 
-        rows = []
+        work = df.copy()
+        side_text = work[side_c].astype(str)
+        skip = side_text.str.contains("취소|정정|거부", na=False)
+        work = work.loc[~skip].copy()
         notes: list[str] = []
-        for _, row in df.iterrows():
-            side_raw = row[side_c]
-            side_text = str(side_raw)
-            # 취소/정정 등 제외
-            if any(tok in side_text for tok in ("취소", "정정", "거부")):
-                continue
-            try:
-                side = ensure_side(side_raw)
-            except ValueError:
-                continue
-
-            qty = abs(clean_number(row[qty_c]))
-            price = clean_number(row[price_c])
-            if qty <= 0:
-                continue
-
-            fee = clean_number(row[fee_c]) if fee_c else 0.0
-            tax = clean_number(row[tax_c]) if tax_c else 0.0
-            total_cost = fee + tax
-
-            if amt_c:
-                settlement = abs(clean_number(row[amt_c]))
-            else:
-                settlement = qty * price + total_cost if side == "매수" else qty * price - total_cost
-
-            code = clean_code(row[code_c])
-            name = str(row[name_c]).strip() if name_c else code
-            date_val = pd.to_datetime(row[date_c], errors="coerce")
-            if pd.isna(date_val):
-                notes.append(f"날짜 스킵: {row[date_c]}")
-                continue
-
-            rows.append(
-                {
-                    "거래일자": date_val.strftime("%Y-%m-%d"),
-                    "사업자": default_business,
-                    "종목코드": code,
-                    "종목명": name,
-                    "거래유형": side,
-                    "수량": qty,
-                    "단가": price,
-                    "수수료": total_cost,
-                    "정산금액": settlement,
-                    "메모": "키움증권",
-                }
+        if work.empty:
+            return BrokerParseResult(
+                self.name, to_standard_frame([]), confidence=self.score(df), notes=notes
             )
 
-        out = to_standard_frame(rows)
-        return BrokerParseResult(self.name, out, confidence=self.score(df), notes=notes)
+        sides = series_ensure_side(work[side_c])
+        qty = series_clean_number(work[qty_c]).abs()
+        price = series_clean_number(work[price_c])
+        fee = series_clean_number(work[fee_c]) if fee_c else 0.0
+        tax = series_clean_number(work[tax_c]) if tax_c else 0.0
+        total_cost = fee + tax
+        if amt_c:
+            settlement = series_clean_number(work[amt_c]).abs()
+        else:
+            settlement = qty * price + total_cost
+            sell_mask = sides == "매도"
+            settlement = settlement.where(~sell_mask, qty * price - total_cost)
+
+        codes = series_clean_code(work[code_c])
+        names = (
+            work[name_c].fillna("").astype(str).str.strip()
+            if name_c
+            else codes.copy()
+        )
+        names = names.where(names != "", codes)
+        dates = pd.to_datetime(work[date_c], errors="coerce")
+
+        valid = (sides != "") & (qty > 0) & dates.notna()
+        bad_dates = (~dates.notna()) & (sides != "") & (qty > 0)
+        if bool(bad_dates.any()):
+            for raw in work.loc[bad_dates, date_c].head(5).tolist():
+                notes.append(f"날짜 스킵: {raw}")
+
+        out = pd.DataFrame(
+            {
+                "거래일자": dates.dt.strftime("%Y-%m-%d"),
+                "사업자": default_business,
+                "종목코드": codes,
+                "종목명": names,
+                "거래유형": sides,
+                "수량": qty,
+                "단가": price,
+                "수수료": total_cost,
+                "정산금액": settlement,
+                "메모": "키움증권",
+            }
+        )
+        out = out.loc[valid].reset_index(drop=True)
+        return BrokerParseResult(
+            self.name, to_standard_frame(out), confidence=self.score(df), notes=notes
+        )

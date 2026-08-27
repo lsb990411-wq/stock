@@ -190,7 +190,7 @@ def inject_sidebar_styles() -> None:
     st.markdown(SIDEBAR_CUSTOM_CSS, unsafe_allow_html=True)
 
 
-STORAGE_CACHE_VERSION = 28  # Storage API 변경 시 증가 → 캐시 무효화
+STORAGE_CACHE_VERSION = 29  # Storage API 변경 시 증가 → 캐시 무효화
 
 
 @st.cache_resource
@@ -3555,7 +3555,7 @@ def page_broker_overseas(storage: Storage) -> None:
         if st.session_state.get("ov_broker_token") != token:
             name = up.name or ""
             file_bytes = up.getvalue()
-            with st.spinner("파일을 분석하고 있습니다..."):
+            with st.spinner("거래 내역을 빠르게 분석하고 있습니다..."):
                 if need_manual and broker_hint != "자동 감지":
                     result = parse_overseas_with_hint(file_bytes, name, broker_hint)
                 else:
@@ -3765,80 +3765,103 @@ def page_broker_overseas(storage: Storage) -> None:
         to_save = apply_overseas_preview_fx(to_save)
         st.session_state.ov_broker_df = to_save
 
-        for idx, row in to_save.iterrows():
-            row_label = str(int(idx) + 1) if isinstance(idx, (int, float)) else str(idx)
-            try:
+        with st.spinner("거래 내역을 빠르게 분석하고 데이터베이스에 저장 중입니다..."):
+            # 종목 일괄 선등록으로 행별 DB 왕복 최소화
+            stock_items: list[tuple[str, str]] = []
+            for _, row in to_save.iterrows():
+                kind = str(row.get("거래유형") or "").strip()
+                if "배당" in kind:
+                    continue
                 ticker = str(row.get("종목코드") or "").strip().upper()
                 name = str(row.get("종목명") or ticker).strip() or ticker
                 if not ticker:
                     ticker = name[:12].upper() if name else ""
-                if not ticker:
-                    raise ValueError("종목코드 없음")
-                qty = _ov_row_float(row, "수량")
-                price_fx = _ov_row_float(row, "외화단가")
-                fee_fx = _ov_row_float(row, "외화수수료")
-                tax_fx = _ov_row_float(row, "외화제세금")
-                fx = coerce_fx_rate(row.get("적용환율"))
-                ccy = normalize_currency(str(row.get("통화코드") or "USD"))
-                kind = str(row.get("거래유형") or "").strip()
-                if "배당" in kind:
-                    skipped_div += 1
-                    continue
-                # 해외매수/매도 및 '매수'/'매도' 포함 표기 허용
-                side = normalize_side(kind)
-                if qty <= 0 or price_fx < 0:
-                    raise ValueError(f"수량/단가를 확인하세요. (수량={qty}, 단가={price_fx})")
+                if ticker:
+                    stock_items.append((ticker, name or ticker))
+            stock_map = storage.ensure_stocks_bulk(
+                stock_items, business_id=bid, market=MARKET_OVERSEAS
+            )
 
-                stock = storage.get_or_create_stock(
-                    ticker, name, business_id=bid, market=MARKET_OVERSEAS
-                )
-                broker_raw = str(row.get("증권사") or "").strip()
-                src_tag = str(st.session_state.get("ov_broker_source") or "")
-                if "메리츠" in broker_raw or "meritz" in src_tag:
-                    source = "broker:meritz-overseas"
-                elif "KB" in broker_raw.upper() or "kb" in src_tag:
-                    source = "broker:kb-overseas"
-                else:
-                    source = "broker:mirae-overseas"
-                broker_name = broker_name_from_source(source, broker_raw) or "미지정"
-                acct = storage.get_or_create_account(
-                    broker_name, bid, market=MARKET_OVERSEAS
-                )
-                price_krw = _fx_to_krw(price_fx, fx)
-                fee_krw = _fx_to_krw(fee_fx, fx)
-                tax_krw = _fx_to_krw(tax_fx, fx)
-                if side == "BUY":
-                    settle = qty * price_krw + fee_krw + tax_krw
-                elif side == "SELL":
-                    settle = qty * price_krw - fee_krw - tax_krw
-                else:
-                    settle = qty * price_krw - tax_krw
+            for idx, row in to_save.iterrows():
+                row_label = str(int(idx) + 1) if isinstance(idx, (int, float)) else str(idx)
+                try:
+                    ticker = str(row.get("종목코드") or "").strip().upper()
+                    name = str(row.get("종목명") or ticker).strip() or ticker
+                    if not ticker:
+                        ticker = name[:12].upper() if name else ""
+                    if not ticker:
+                        raise ValueError("종목코드 없음")
+                    qty = _ov_row_float(row, "수량")
+                    price_fx = _ov_row_float(row, "외화단가")
+                    fee_fx = _ov_row_float(row, "외화수수료")
+                    tax_fx = _ov_row_float(row, "외화제세금")
+                    fx = coerce_fx_rate(row.get("적용환율"))
+                    ccy = normalize_currency(str(row.get("통화코드") or "USD"))
+                    kind = str(row.get("거래유형") or "").strip()
+                    if "배당" in kind:
+                        skipped_div += 1
+                        continue
+                    # 해외매수/매도 및 '매수'/'매도' 포함 표기 허용
+                    side = normalize_side(kind)
+                    if qty <= 0 or price_fx < 0:
+                        raise ValueError(f"수량/단가를 확인하세요. (수량={qty}, 단가={price_fx})")
 
-                trades.append(
-                    Trade(
-                        id=None,
-                        trade_date=str(row.get("거래일자") or "")[:10],
-                        business_id=bid,
-                        stock_id=int(stock.id),  # type: ignore[arg-type]
-                        side=side,  # type: ignore[arg-type]
-                        quantity=qty,
-                        price=price_krw,
-                        fee=fee_krw,
-                        tax=tax_krw,
-                        settlement_amount=settle,
-                        memo=str(row.get("메모") or "overseas-broker"),
-                        source=source,
-                        currency=ccy,
-                        fx_rate=fx,
-                        price_fx=price_fx,
-                        fee_fx=fee_fx,
-                        tax_fx=tax_fx,
-                        account_id=int(acct.id) if acct.id is not None else None,
-                        account_name=acct.name,
+                    stock = stock_map.get(ticker)
+                    if stock is None:
+                        stock = storage.get_or_create_stock(
+                            ticker, name, business_id=bid, market=MARKET_OVERSEAS
+                        )
+                        stock_map[ticker] = stock
+                    broker_raw = str(row.get("증권사") or "").strip()
+                    src_tag = str(st.session_state.get("ov_broker_source") or "")
+                    if "메리츠" in broker_raw or "meritz" in src_tag:
+                        source = "broker:meritz-overseas"
+                    elif "KB" in broker_raw.upper() or "kb" in src_tag:
+                        source = "broker:kb-overseas"
+                    else:
+                        source = "broker:mirae-overseas"
+                    broker_name = broker_name_from_source(source, broker_raw) or "미지정"
+                    acct = storage.get_or_create_account(
+                        broker_name, bid, market=MARKET_OVERSEAS
                     )
-                )
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"행 {row_label}: {exc}")
+                    price_krw = _fx_to_krw(price_fx, fx)
+                    fee_krw = _fx_to_krw(fee_fx, fx)
+                    tax_krw = _fx_to_krw(tax_fx, fx)
+                    if side == "BUY":
+                        settle = qty * price_krw + fee_krw + tax_krw
+                    elif side == "SELL":
+                        settle = qty * price_krw - fee_krw - tax_krw
+                    else:
+                        settle = qty * price_krw - tax_krw
+
+                    trades.append(
+                        Trade(
+                            id=None,
+                            trade_date=str(row.get("거래일자") or "")[:10],
+                            business_id=bid,
+                            stock_id=int(stock.id),  # type: ignore[arg-type]
+                            side=side,  # type: ignore[arg-type]
+                            quantity=qty,
+                            price=price_krw,
+                            fee=fee_krw,
+                            tax=tax_krw,
+                            settlement_amount=settle,
+                            memo=str(row.get("메모") or "overseas-broker"),
+                            source=source,
+                            currency=ccy,
+                            fx_rate=fx,
+                            price_fx=price_fx,
+                            fee_fx=fee_fx,
+                            tax_fx=tax_fx,
+                            account_id=int(acct.id) if acct.id is not None else None,
+                            account_name=acct.name,
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"행 {row_label}: {exc}")
+
+            if trades:
+                storage.add_trades_bulk(trades)
 
         if not trades:
             err_msg = (
@@ -3858,7 +3881,6 @@ def page_broker_overseas(storage: Storage) -> None:
                 )
             return
 
-        storage.add_trades_bulk(trades)
         zero_fx_n = sum(1 for t in trades if float(getattr(t, "fx_rate", 0) or 0) <= 0)
         msg = f"✅ 등록이 완료되었습니다! {len(trades)}건 반영 → {biz}"
         if zero_fx_n:
@@ -3989,7 +4011,7 @@ def page_broker(
                         return
                     file_ext = "pdf"
 
-                with st.spinner("파일을 분석 중입니다..."):
+                with st.spinner("거래 내역을 빠르게 분석하고 있습니다..."):
                     result = detect_and_parse(
                         up.getvalue(),
                         up.name if file_ext != "pdf" or up.name.lower().endswith(".pdf") else f"{up.name}.pdf",
@@ -4112,15 +4134,16 @@ def page_broker(
             to_save["사업자"] = to_save["사업자"].fillna(biz).replace("", biz)
 
         source_name = st.session_state.get("broker_parse_name", "broker")
-        trades, errors = dataframe_to_trades(
-            to_save,
-            storage,
-            default_business=biz,
-            source=f"broker:{source_name}",
-            market=market,
-        )
-        if trades:
-            storage.add_trades_bulk(trades)
+        with st.spinner("거래 내역을 빠르게 분석하고 데이터베이스에 저장 중입니다..."):
+            trades, errors = dataframe_to_trades(
+                to_save,
+                storage,
+                default_business=biz,
+                source=f"broker:{source_name}",
+                market=market,
+            )
+            if trades:
+                storage.add_trades_bulk(trades)
         st.success(f"{len(trades)}건 반영 완료 ({source_name} → {biz})")
         if errors:
             with st.expander(f"오류/스킵 {len(errors)}건"):
@@ -4205,7 +4228,7 @@ def page_legacy_journal(
         token = f"{up.name}:{up.size}:{biz}"
         if st.session_state.get("legacy_token") != token:
             try:
-                with st.spinner("엑셀을 분석 중입니다..."):
+                with st.spinner("엑셀을 빠르게 분석하고 있습니다..."):
                     df, notes, stats = parse_legacy_journal_excel(
                         up.getvalue(), default_business=biz
                     )
@@ -4290,15 +4313,16 @@ def page_legacy_journal(
                 ]
             to_save["사업자"] = biz
 
-            trades, errors = dataframe_to_trades(
-                to_save,
-                storage,
-                default_business=biz,
-                source="legacy_journal",
-                market=market,
-            )
-            if trades:
-                storage.add_trades_bulk(trades)
+            with st.spinner("거래 내역을 빠르게 분석하고 데이터베이스에 저장 중입니다..."):
+                trades, errors = dataframe_to_trades(
+                    to_save,
+                    storage,
+                    default_business=biz,
+                    source="legacy_journal",
+                    market=market,
+                )
+                if trades:
+                    storage.add_trades_bulk(trades)
 
             st.session_state["_legacy_toast"] = True
             st.session_state["_legacy_toast_msg"] = (
@@ -4891,7 +4915,7 @@ def page_income(storage: Storage, business_id: int | None) -> None:
     if uploaded is not None:
         token = f"{uploaded.name}:{uploaded.size}"
         if st.session_state.get("income_upload_token") != token:
-            with st.spinner("파일을 분석 중입니다..."):
+            with st.spinner("거래 내역을 빠르게 분석하고 있습니다..."):
                 result = parse_income_file(uploaded.getvalue(), uploaded.name)
             for note in result.notes:
                 st.info(note)

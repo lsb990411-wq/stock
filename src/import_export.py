@@ -128,18 +128,43 @@ def read_tabular(file_bytes: bytes, filename: str) -> pd.DataFrame:
         for enc in ("utf-8-sig", "cp949", "euc-kr", "utf-8"):
             bio.seek(0)
             try:
-                return pd.read_csv(bio, encoding=enc)
+                # low_memory=False + engine=c 로 대용량 CSV 읽기 속도 향상
+                return pd.read_csv(bio, encoding=enc, low_memory=False)
             except UnicodeDecodeError:
                 continue
         bio.seek(0)
-        return pd.read_csv(bio)
+        return pd.read_csv(bio, low_memory=False)
     if ext in {"xlsx", "xls"} or name.endswith((".xlsx", ".xls")):
-        return pd.read_excel(bio)
+        engine = "xlrd" if ext == "xls" or name.endswith(".xls") else "openpyxl"
+        return pd.read_excel(bio, engine=engine, dtype=str)
     if ext == "pdf" or name.endswith(".pdf"):
         raise ValueError(
             "PDF는 read_tabular로 처리할 수 없습니다. PDF 전용 파서를 사용하세요."
         )
     raise ValueError(f"지원하지 않는 파일 형식입니다: {ext or name} (지원: csv, xlsx, xls)")
+
+
+def _series_clean_code(series: pd.Series) -> pd.Series:
+    s = series.fillna("").astype(str).str.strip()
+    s = s.replace({"nan": "", "None": "", "none": ""})
+    s = s.str.replace(r"\.0$", "", regex=True)
+    # 숫자 코드만 6자리 zero-pad
+    mask = s.str.fullmatch(r"\d{1,6}")
+    s = s.where(~mask, s.str.zfill(6))
+    return s
+
+
+def _series_to_float(series: pd.Series, default: float = 0.0) -> pd.Series:
+    s = series
+    if s.dtype == object or str(s.dtype) == "string":
+        s = (
+            s.astype(str)
+            .str.replace(",", "", regex=False)
+            .str.replace("원", "", regex=False)
+            .str.strip()
+            .replace({"": default, "-": default, "nan": default, "None": default, "none": default})
+        )
+    return pd.to_numeric(s, errors="coerce").fillna(default)
 
 
 def dataframe_to_trades(
@@ -150,7 +175,12 @@ def dataframe_to_trades(
     source: str = "csv",
     market: str = "domestic",
 ) -> tuple[list[Trade], list[str]]:
-    """표준/유사 컬럼 DataFrame을 Trade 리스트로 변환하고 종목/사업자를 자동 생성."""
+    """표준/유사 컬럼 DataFrame을 Trade 리스트로 변환하고 종목/사업자를 자동 생성.
+
+    대용량 최적화:
+    - 사업자/증권사/종목을 행마다 DB 조회하지 않고 메모리 캐시 + stocks 일괄 insert
+    - 수치/코드 컬럼은 pandas 벡터 연산으로 전처리
+    """
     from .models import normalize_market
 
     mkt = normalize_market(market)
@@ -162,119 +192,222 @@ def dataframe_to_trades(
     if "종목코드" not in work.columns and "종목명" not in work.columns:
         raise ValueError("종목코드 또는 종목명 컬럼이 필요합니다.")
 
+    # --- 벡터 전처리 ---
+    n = len(work)
+    if n == 0:
+        return [], []
+
+    if "사업자" in work.columns:
+        biz_series = (
+            work["사업자"].fillna("").astype(str).str.strip().replace({"nan": "", "None": ""})
+        )
+        biz_series = biz_series.where(biz_series != "", default_business or "")
+    else:
+        biz_series = pd.Series([default_business or ""] * n, index=work.index)
+
+    code_series = (
+        _series_clean_code(work["종목코드"])
+        if "종목코드" in work.columns
+        else pd.Series([""] * n, index=work.index)
+    )
+    name_series = (
+        work["종목명"].fillna("").astype(str).str.strip().replace({"nan": "", "None": "", "none": ""})
+        if "종목명" in work.columns
+        else pd.Series([""] * n, index=work.index)
+    )
+    qty_series = _series_to_float(work["수량"])
+    price_series = _series_to_float(work["단가"])
+    fee_series = (
+        _series_to_float(work["수수료"]) if "수수료" in work.columns else pd.Series(0.0, index=work.index)
+    )
+    tax_series = (
+        _series_to_float(work["제세금"]) if "제세금" in work.columns else pd.Series(0.0, index=work.index)
+    )
+    if "정산금액" in work.columns:
+        settle_series = _series_to_float(work["정산금액"])
+        settle_na = work["정산금액"].isna()
+    else:
+        settle_series = pd.Series(0.0, index=work.index)
+        settle_na = pd.Series(True, index=work.index)
+
+    memo_series = (
+        work["메모"].fillna("").astype(str).str.strip().replace({"nan": "", "None": ""})
+        if "메모" in work.columns
+        else pd.Series([""] * n, index=work.index)
+    )
+
+    fx_col = None
+    if "환율" in work.columns:
+        fx_col = "환율"
+    elif "적용환율" in work.columns:
+        fx_col = "적용환율"
+    fx_series = (
+        work[fx_col].map(coerce_fx_rate) if fx_col else pd.Series(0.0, index=work.index)
+    )
+    price_fx_series = (
+        _series_to_float(work["외화단가"]) if "외화단가" in work.columns else pd.Series(0.0, index=work.index)
+    )
+    fee_fx_series = (
+        _series_to_float(work["외화수수료"]) if "외화수수료" in work.columns else pd.Series(0.0, index=work.index)
+    )
+    tax_fx_series = (
+        _series_to_float(work["외화제세금"]) if "외화제세금" in work.columns else pd.Series(0.0, index=work.index)
+    )
+    if "통화" in work.columns:
+        currency_series = work["통화"].fillna("KRW").astype(str).map(normalize_currency)
+    elif "통화코드" in work.columns:
+        currency_series = work["통화코드"].fillna("KRW").astype(str).map(normalize_currency)
+    else:
+        currency_series = pd.Series(["KRW"] * n, index=work.index)
+
+    broker_series = (
+        work["증권사"].fillna("").astype(str).str.strip().replace({"nan": "", "None": ""})
+        if "증권사" in work.columns
+        else pd.Series([""] * n, index=work.index)
+    )
+
+    # 날짜 일괄 파싱
+    date_parsed = pd.to_datetime(work["거래일자"], errors="coerce")
+
+    # --- 캐시: 사업자 / 증권사 / 종목 ---
+    biz_cache: dict[str, Any] = {}
+    acct_cache: dict[tuple[int, str], Any] = {}  # (business_id, broker_name) -> Account
+    stock_by_biz_code: dict[int, dict[str, Any]] = {}  # business_id -> {code: Stock}
+    stock_by_biz_name: dict[int, dict[str, Any]] = {}  # business_id -> {name: Stock}
+
+    # 사업자 선확보 (고유값만)
+    for biz_name in sorted({str(x).strip() for x in biz_series.tolist() if str(x).strip()}):
+        biz_cache[biz_name] = storage.get_or_create_business(biz_name)
+
+    # 코드 있는 종목 일괄 확보 (사업자별)
+    from collections import defaultdict
+
+    pending_stocks: dict[int, list[tuple[str, str]]] = defaultdict(list)
+    for biz_name, code, name in zip(biz_series.tolist(), code_series.tolist(), name_series.tolist()):
+        biz_name = str(biz_name or "").strip()
+        if not biz_name or biz_name not in biz_cache:
+            continue
+        code = str(code or "").strip()
+        name = str(name or "").strip()
+        if code:
+            bid = int(biz_cache[biz_name].id)
+            pending_stocks[bid].append((code, name or code))
+
+    for bid, items in pending_stocks.items():
+        stock_by_biz_code[bid] = storage.ensure_stocks_bulk(
+            items, business_id=bid, market=mkt
+        )
+
+    # 증권사 선확보
+    for biz_name, broker_raw in zip(biz_series.tolist(), broker_series.tolist()):
+        biz_name = str(biz_name or "").strip()
+        if not biz_name or biz_name not in biz_cache:
+            continue
+        broker_name = broker_name_from_source(source, str(broker_raw or ""))
+        if not broker_name:
+            continue
+        bid = int(biz_cache[biz_name].id)
+        key = (bid, broker_name)
+        if key not in acct_cache:
+            acct_cache[key] = storage.get_or_create_account(
+                broker_name, bid, market=mkt
+            )
+
     errors: list[str] = []
     trades: list[Trade] = []
+    created_at = now_str()
 
-    for idx, row in work.iterrows():
-        row_no = int(idx) + 2  # header + 1-based
+    for i, idx in enumerate(work.index):
+        row_no = int(idx) + 2 if isinstance(idx, (int, float)) else i + 2
         try:
-            biz_name = str(row.get("사업자", "") or "").strip() or (default_business or "")
+            biz_name = str(biz_series.iloc[i] or "").strip()
             if not biz_name:
                 raise ValueError("사업자 정보가 없습니다.")
-            business = storage.get_or_create_business(biz_name)
+            business = biz_cache.get(biz_name)
+            if business is None:
+                business = storage.get_or_create_business(biz_name)
+                biz_cache[biz_name] = business
+            bid = int(business.id)
 
-            code = str(row.get("종목코드", "") or "").strip()
-            if code.lower() in {"nan", "none"}:
-                code = ""
-            # 종목코드가 숫자로 읽힌 경우 보정
-            if code.endswith(".0"):
-                code = code[:-2]
-            code = code.zfill(6) if code.isdigit() and len(code) <= 6 else code
-            name = str(row.get("종목명", "") or "").strip()
-            if name.lower() in {"nan", "none"}:
-                name = ""
+            code = str(code_series.iloc[i] or "").strip()
+            name = str(name_series.iloc[i] or "").strip()
 
+            stock = None
             if code:
-                stock = storage.get_or_create_stock(
-                    code,
-                    name or code,
-                    business_id=int(business.id),
-                    market=mkt,
-                )
+                code_map = stock_by_biz_code.get(bid)
+                if code_map is None:
+                    code_map = storage.ensure_stocks_bulk(
+                        [(code, name or code)], business_id=bid, market=mkt
+                    )
+                    stock_by_biz_code[bid] = code_map
+                stock = code_map.get(code)
+                if stock is None:
+                    stock = storage.get_or_create_stock(
+                        code, name or code, business_id=bid, market=mkt
+                    )
+                    code_map[code] = stock
             elif name:
-                stock = storage.get_or_create_stock_by_name(
-                    name, business_id=int(business.id), market=mkt
-                )
+                name_map = stock_by_biz_name.setdefault(bid, {})
+                stock = name_map.get(name)
+                if stock is None:
+                    stock = storage.get_or_create_stock_by_name(
+                        name, business_id=bid, market=mkt
+                    )
+                    name_map[name] = stock
+                    if stock.code:
+                        stock_by_biz_code.setdefault(bid, {})[stock.code] = stock
             else:
                 raise ValueError("종목코드 또는 종목명이 필요합니다.")
 
-            side = normalize_side(row["거래유형"])
-            qty = _to_float(row["수량"])
-            price = _to_float(row["단가"])
-            fee = _to_float(row.get("수수료", 0))
-            tax = _to_float(row.get("제세금", 0)) if "제세금" in work.columns else 0.0
-            settlement = None
-            if "정산금액" in work.columns and not pd.isna(row.get("정산금액")):
-                settlement = _to_float(row.get("정산금액"))
-            memo = str(row.get("메모", "") or "").strip()
-
-            # 환율: 비어 있으면 추정하지 않고 0 등록
-            fx_raw = row.get("환율") if "환율" in work.columns else None
-            if fx_raw is None and "적용환율" in work.columns:
-                fx_raw = row.get("적용환율")
-            fx_rate = coerce_fx_rate(fx_raw)
-            price_fx = (
-                _to_float(row.get("외화단가", 0))
-                if "외화단가" in work.columns
-                else 0.0
-            )
-            fee_fx = (
-                _to_float(row.get("외화수수료", 0))
-                if "외화수수료" in work.columns
-                else 0.0
-            )
-            tax_fx = (
-                _to_float(row.get("외화제세금", 0))
-                if "외화제세금" in work.columns
-                else 0.0
-            )
-            currency = "KRW"
-            if "통화" in work.columns:
-                currency = normalize_currency(str(row.get("통화") or "KRW"))
-            elif "통화코드" in work.columns:
-                currency = normalize_currency(str(row.get("통화코드") or "KRW"))
-
+            side = normalize_side(work["거래유형"].iloc[i])
+            qty = float(qty_series.iloc[i])
+            price = float(price_series.iloc[i])
             if qty <= 0:
                 raise ValueError("수량은 0보다 커야 합니다.")
 
-            broker_raw = ""
-            if "증권사" in work.columns:
-                broker_raw = str(row.get("증권사") or "").strip()
-            broker_name = broker_name_from_source(source, broker_raw)
+            fee = float(fee_series.iloc[i])
+            tax = float(tax_series.iloc[i]) if side == "SELL" else 0.0
+            settlement = None if bool(settle_na.iloc[i]) else float(settle_series.iloc[i])
+
+            ts = date_parsed.iloc[i]
+            if pd.isna(ts):
+                raise ValueError(f"날짜 파싱 실패: {work['거래일자'].iloc[i]}")
+            trade_date = ts.strftime("%Y-%m-%d")
+
+            broker_name = broker_name_from_source(source, str(broker_series.iloc[i] or ""))
             account_id = None
             account_name = ""
             if broker_name:
-                acct = storage.get_or_create_account(
-                    broker_name,
-                    int(business.id),  # type: ignore[arg-type]
-                    market=mkt,
-                )
+                acct = acct_cache.get((bid, broker_name))
+                if acct is None:
+                    acct = storage.get_or_create_account(broker_name, bid, market=mkt)
+                    acct_cache[(bid, broker_name)] = acct
                 account_id = int(acct.id) if acct.id is not None else None
                 account_name = acct.name
 
             trades.append(
                 Trade(
                     id=None,
-                    trade_date=_parse_date(row["거래일자"]),
+                    trade_date=trade_date,
                     business_id=business.id,  # type: ignore[arg-type]
                     stock_id=stock.id,  # type: ignore[arg-type]
                     side=side,
                     quantity=qty,
                     price=price,
                     fee=fee,
-                    tax=tax if side == "SELL" else 0.0,
+                    tax=tax,
                     settlement_amount=settlement,
-                    memo=memo,
+                    memo=str(memo_series.iloc[i] or ""),
                     source=source,
-                    created_at=now_str(),
+                    created_at=created_at,
                     business_name=business.name,
                     stock_code=stock.code,
                     stock_name=stock.name,
-                    currency=currency,
-                    fx_rate=fx_rate,
-                    price_fx=price_fx,
-                    fee_fx=fee_fx,
-                    tax_fx=tax_fx,
+                    currency=str(currency_series.iloc[i] or "KRW"),
+                    fx_rate=float(fx_series.iloc[i] or 0),
+                    price_fx=float(price_fx_series.iloc[i] or 0),
+                    fee_fx=float(fee_fx_series.iloc[i] or 0),
+                    tax_fx=float(tax_fx_series.iloc[i] or 0),
                     account_id=account_id,
                     account_name=account_name,
                 )

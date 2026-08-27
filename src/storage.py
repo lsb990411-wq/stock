@@ -142,6 +142,28 @@ class Storage:
 
         return _with_retry(_run, label=f"{table}.insert")
 
+    def _insert_many(
+        self,
+        table: str,
+        rows: list[dict[str, Any]],
+        *,
+        chunk_size: int = 500,
+    ) -> list[dict[str, Any]]:
+        """리스트를 청크 단위로 한 번에 insert (네트워크 왕복 최소화)."""
+        if not rows:
+            return []
+        out: list[dict[str, Any]] = []
+        size = max(1, int(chunk_size))
+        for i in range(0, len(rows), size):
+            batch = rows[i : i + size]
+
+            def _run(b: list[dict[str, Any]] = batch) -> list[dict[str, Any]]:
+                res = self._sb().table(table).insert(b).select("*").execute()
+                return list(res.data or [])
+
+            out.extend(_with_retry(_run, label=f"{table}.bulk_insert"))
+        return out
+
     def _update(
         self,
         table: str,
@@ -731,19 +753,62 @@ class Storage:
         row = self._insert("trades", self._trade_payload(trade))
         return int(row["id"])
 
-    def add_trades_bulk(self, trades: list[Trade]) -> int:
+    def add_trades_bulk(self, trades: list[Trade], *, chunk_size: int = 500) -> int:
+        """거래 리스트를 청크 단위로 대량 insert."""
         if not trades:
             return 0
         payload = [self._trade_payload(t) for t in trades]
-        count = 0
-        for i in range(0, len(payload), 80):
-            batch = payload[i : i + 80]
-            _with_retry(
-                lambda b=batch: self._sb().table("trades").insert(b).execute(),
-                label="trades.bulk_insert",
+        inserted = self._insert_many("trades", payload, chunk_size=chunk_size)
+        return len(inserted) if inserted else len(payload)
+
+    def ensure_stocks_bulk(
+        self,
+        items: list[tuple[str, str]],
+        *,
+        business_id: int,
+        market: str | None = MARKET_DOMESTIC,
+    ) -> dict[str, Stock]:
+        """(code, name) 목록을 미리 로드·일괄 생성 후 code→Stock 맵 반환.
+
+        행마다 get_or_create_stock을 호출하지 않도록, 누락 종목만 한 번에 insert한다.
+        """
+        if business_id is None:
+            raise ValueError("종목 일괄 등록 시 사업자가 필요합니다.")
+        bid = int(business_id)
+        mkt = normalize_market(market)
+
+        existing = self.list_stocks(business_id=bid, market=mkt)
+        by_code: dict[str, Stock] = {
+            (s.code or "").strip(): s for s in existing if (s.code or "").strip()
+        }
+
+        to_create: list[dict[str, Any]] = []
+        seen_new: set[str] = set()
+        for code_raw, name_raw in items:
+            code = (code_raw or "").strip()
+            name = (name_raw or "").strip() or code
+            if not code or code in by_code or code in seen_new:
+                continue
+            seen_new.add(code)
+            to_create.append(
+                {
+                    "business_id": bid,
+                    "code": code,
+                    "name": name,
+                    "market": mkt,
+                    "note": "",
+                    "partner_code": "",
+                    "created_at": now_str(),
+                }
             )
-            count += len(batch)
-        return count
+
+        if to_create:
+            created_rows = self._insert_many("stocks", to_create, chunk_size=500)
+            for row in created_rows:
+                stock = _from_row(Stock, row)
+                by_code[(stock.code or "").strip()] = stock
+
+        return by_code
 
     def delete_trade(self, trade_id: int) -> None:
         self._delete("trades", eq={"id": int(trade_id)})

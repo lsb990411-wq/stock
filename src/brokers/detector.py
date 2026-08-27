@@ -303,7 +303,8 @@ def detect_and_parse_overseas(
 
         probe = pd.read_excel(
             BytesIO(file_bytes),
-            engine="xlrd" if ext == "xls" else None,
+            engine="xlrd" if ext == "xls" else "openpyxl",
+            dtype=str,
         )
     except Exception:  # noqa: BLE001
         probe = None
