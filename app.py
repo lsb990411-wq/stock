@@ -4915,11 +4915,13 @@ def page_income(storage: Storage, business_id: int | None) -> None:
     if uploaded is not None:
         token = f"{uploaded.name}:{uploaded.size}"
         if st.session_state.get("income_upload_token") != token:
-            with st.spinner("거래 내역을 빠르게 분석하고 있습니다..."):
+            with st.spinner(
+                "파일을 분석 중입니다... (스캔 PDF는 OCR로 수 초~수십 초 걸릴 수 있습니다)"
+            ):
                 result = parse_income_file(uploaded.getvalue(), uploaded.name)
-            for note in result.notes:
-                st.info(note)
             if result.rows:
+                for note in result.notes:
+                    st.info(note)
                 st.session_state["income_preview_df"] = rows_to_dataframe(result.rows)
                 st.session_state["income_preview_source"] = result.source
                 st.session_state["income_upload_token"] = token

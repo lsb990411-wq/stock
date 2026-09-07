@@ -315,10 +315,55 @@ def empty_trade_rows(default_business: str, n: int = 5) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=STANDARD_EMPTY_COLUMNS)
 
 
-def _ocr_pdf_text(file_bytes: bytes, *, max_pages: int = 8) -> tuple[str, list[str]]:
+def _ocr_score_text(text: str) -> int:
+    """OCR 후보 텍스트 품질 점수 (날짜·한글·키워드 가중)."""
+    if not text:
+        return 0
+    score = 0
+    score += len(re.findall(r"20\d{2}/\d{2}/\d{2}", text)) * 5
+    score += len(re.findall(r"[가-힣]", text))
+    for kw in ("원천징수", "지급액", "미래에셋", "배당", "이자", "거래일자", "종목"):
+        if kw in text:
+            score += 50
+    return score
+
+
+def _ocr_detect_rotation(img: Any, pytesseract: Any) -> int:
+    """첫 페이지 이미지에서 최적 회전각(도)을 찾는다."""
+    candidates = [0, 90, 180, 270]
+    try:
+        osd = pytesseract.image_to_osd(img)
+        m = re.search(r"Rotate:\s*(\d+)", osd or "")
+        if m:
+            rot = int(m.group(1)) % 360
+            if rot in candidates:
+                candidates.remove(rot)
+                candidates.insert(0, rot)
+    except Exception:  # noqa: BLE001
+        pass
+
+    best_rot = 0
+    best_score = -1
+    for rot in candidates:
+        trial = img.rotate(rot, expand=True) if rot else img
+        try:
+            sample = pytesseract.image_to_string(trial, lang="eng")
+        except Exception:  # noqa: BLE001
+            sample = ""
+        score = _ocr_score_text(sample)
+        if re.search(r"\d{2}/\d{2}/9Z0\d|\d{2}/\d{2}/920\d", sample or ""):
+            score -= 30
+        if score > best_score:
+            best_score = score
+            best_rot = rot
+    return best_rot
+
+
+def _ocr_pdf_text(file_bytes: bytes, *, max_pages: int = 12) -> tuple[str, list[str]]:
     """
     스캔(이미지) PDF용 OCR fallback.
     pytesseract + pdfplumber 페이지 렌더링을 사용한다.
+    방향이 뒤집힌 스캔본은 첫 페이지에서 회전각을 구한 뒤 전 페이지에 적용한다.
     """
     notes: list[str] = []
     try:
@@ -327,6 +372,15 @@ def _ocr_pdf_text(file_bytes: bytes, *, max_pages: int = 8) -> tuple[str, list[s
         notes.append(OCR_TIP)
         notes.append("OCR 사용 시: pip install pytesseract 및 Tesseract-OCR 본체를 설치하세요.")
         return "", notes
+
+    # Windows 기본 설치 경로 보조
+    import os
+    from shutil import which
+
+    if which("tesseract") is None:
+        win_tess = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+        if os.path.isfile(win_tess):
+            pytesseract.pytesseract.tesseract_cmd = win_tess
 
     try:
         import pdfplumber
@@ -342,13 +396,22 @@ def _ocr_pdf_text(file_bytes: bytes, *, max_pages: int = 8) -> tuple[str, list[s
                 notes.append("PDF 페이지가 비어 있습니다.")
                 return "", notes
             notes.append(f"OCR 시도 중… (최대 {len(pages)}페이지)")
+
+            first_img = pages[0].to_image(resolution=180).original
+            best_rot = _ocr_detect_rotation(first_img, pytesseract)
+            if best_rot:
+                notes.append(f"스캔 방향 보정: {best_rot}° 회전")
+
             for idx, page in enumerate(pages, start=1):
                 try:
-                    rendered = page.to_image(resolution=200)
-                    img = rendered.original
-                    text = pytesseract.image_to_string(img, lang="kor+eng")
+                    img = page.to_image(resolution=220).original
+                    if best_rot:
+                        img = img.rotate(best_rot, expand=True)
+                    try:
+                        text = pytesseract.image_to_string(img, lang="kor+eng")
+                    except Exception:  # noqa: BLE001
+                        text = pytesseract.image_to_string(img, lang="eng")
                     if not text.strip():
-                        # 한국어 데이터 없을 때 eng만 재시도
                         text = pytesseract.image_to_string(img, lang="eng")
                     parts.append(text or "")
                 except pytesseract.TesseractNotFoundError:

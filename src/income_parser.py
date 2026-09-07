@@ -372,7 +372,12 @@ def parse_income_excel(file_bytes: bytes, filename: str = "") -> IncomeParseResu
     return IncomeParseResult(rows=rows, notes=notes, source="excel")
 
 
-def _extract_pdf_text(file_bytes: bytes, *, include_tables: bool = True) -> str:
+def _extract_pdf_text(
+    file_bytes: bytes,
+    *,
+    include_tables: bool = True,
+    ocr_fallback: bool = True,
+) -> str:
     import pdfplumber
 
     parts: list[str] = []
@@ -389,7 +394,17 @@ def _extract_pdf_text(file_bytes: bytes, *, include_tables: bool = True) -> str:
                     cells = [str(c or "").strip() for c in row]
                     if any(cells):
                         parts.append(" | ".join(cells))
-    return "\n".join(parts)
+    joined = "\n".join(parts)
+    if ocr_fallback and len(joined.strip()) < 50:
+        try:
+            from .brokers.pdf_parser import _ocr_pdf_text
+
+            ocr_text, _notes = _ocr_pdf_text(file_bytes)
+            if ocr_text.strip():
+                joined = f"{joined}\n{ocr_text}".strip()
+        except Exception:  # noqa: BLE001
+            pass
+    return joined
 
 
 def _pick_amount_near(text: str, labels: list[str]) -> float:
@@ -746,6 +761,95 @@ _MIRAE_WH_LINE = re.compile(
 _MIRAE_WH_SKIP_NAME = re.compile(
     r"고객센터|홈페이지|합\s*계|징수|의무자|페이지|지급명세|원천징수"
 )
+# 스캔 OCR용: 지급일 + (끝쪽) 지급액·세율14·세액 묶음
+_MIRAE_WH_OCR_DATE = re.compile(r"^(?P<pay>\d{4}[./-]\d{2}[./-]\d{2})")
+_MIRAE_WH_OCR_YM = re.compile(r"(?P<ym>\d{4}[./-]\d{2})(?!\d)")
+_MIRAE_WH_OCR_TAIL = re.compile(
+    r"(?P<amount>-?[\d,]{3,})\s+"
+    r"(?P<taxrate>1[45][.,]\d{1,2})\s+"
+    r"(?P<inc>[\d,]+)\s+"
+    r"(?P<corp>[\d,]+)\s+"
+    r"(?P<local>[\d,]+)\s+"
+    r"(?P<agri>[\d,]+)\s+"
+    r"(?P<total>[\d,]+)"
+)
+_MIRAE_WH_OCR_RATE = re.compile(
+    r"(?P<rate>\d{1,2}[.,]\d{2})\s+(?P<amount>-?[\d,]{3,})\s+(?P<taxrate>1[45][.,]\d{1,2})"
+)
+
+
+def _mirae_wh_norm_date(raw: str) -> str:
+    text = str(raw or "").strip().replace(".", "/").replace("-", "/")
+    m = re.match(r"(20\d{2})/(\d{2})/(\d{2})", text)
+    if not m:
+        return ""
+    return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+
+
+def _parse_mirae_wh_ocr_line(line: str) -> dict[str, Any] | None:
+    """스캔 OCR로 깨진 원천징수 행을 느슨하게 파싱."""
+    dm = _MIRAE_WH_OCR_DATE.match(line)
+    if not dm:
+        return None
+    if "합계" in line or "고객센터" in line:
+        return None
+    tail = _MIRAE_WH_OCR_TAIL.search(line)
+    if not tail:
+        return None
+    amount = _to_number(tail.group("amount"))
+    if amount == 0:
+        return None
+
+    rate = 0.0
+    rm = _MIRAE_WH_OCR_RATE.search(line)
+    if rm and abs(_to_number(rm.group("amount")) - amount) < 0.01:
+        rate = _to_number(rm.group("rate"))
+
+    # 과세구분 / 소득코드 추정
+    tax = "C"
+    if re.search(r"(?<![A-Z])W(?![A-Z0-9])", line) or "배당" in line:
+        tax = "W"
+    icode = 18
+    if tax == "W":
+        icode = 56
+    elif rate and 1.0 <= rate <= 10.0:
+        icode = 18
+    elif amount >= 10000 and rate <= 0:
+        # 세율칸이 깨진 배당행 추정
+        tax, icode = "W", 56
+
+    ym_m = _MIRAE_WH_OCR_YM.search(line[10:])  # 지급일 다음부터
+    ym = ""
+    if ym_m:
+        ym = ym_m.group("ym").replace(".", "/").replace("-", "/")
+
+    pay = _mirae_wh_norm_date(dm.group("pay"))
+    if not pay:
+        return None
+    if not ym:
+        ym = pay[:7].replace("-", "/")
+    itype = _mirae_wh_income_type(tax, icode)
+    product = "예탁금이용료" if itype == "이자" else "배당"
+    return {
+        "지급일": pay,
+        "금융상품명": product,
+        "증권사": "미래에셋증권",
+        "소득구분": itype,
+        "종목코드": "",
+        "통화": "KRW",
+        "외화지급액": 0.0,
+        "외화원천세": 0.0,
+        "환율": 0.0,
+        "지급액": amount,
+        "법인세": _to_number(tail.group("corp")),
+        "지방소득세": _to_number(tail.group("local")),
+        "메모": (
+            f"미래에셋증권 원천징수 / 과세구분={tax} / "
+            f"귀속년월={ym.replace('/', '-')} / OCR"
+        ),
+        "_period": pay,
+        "_ticker": product,
+    }
 
 
 def _is_mirae_withholding_pdf(text: str, filename: str = "") -> bool:
@@ -816,53 +920,66 @@ def parse_mirae_withholding_pdf(
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     pending: list[tuple[str, str, dict[str, Any]]] = []
     skipped_zero = 0
+    used_ocr_fallback = False
     for i, line in enumerate(lines):
         m = _MIRAE_WH_LINE.match(line)
-        if not m:
-            continue
-        amount = _to_number(m.group("amount"))
-        if amount == 0:
-            skipped_zero += 1
-            continue
-        tax = m.group("tax")
-        icode = int(m.group("icode"))
-        itype = _mirae_wh_income_type(tax, icode)
-        ticker = (m.group("ticker") or "").strip()
-        pstart = m.group("pstart") or ""
-        pay_raw = m.group("pay")
-        period = f"{pstart}~{pay_raw}" if pstart else pay_raw
-        nxt = lines[i + 1] if i + 1 < len(lines) else ""
-        product = _mirae_wh_product_name(ticker, nxt, tax, icode)
-        ym = m.group("ym").replace("/", "-")
-        memo_bits = [
-            "미래에셋증권 원천징수",
-            f"과세구분={tax}",
-            f"소득기간={period.replace('/', '-')}",
-            f"귀속년월={ym}",
-        ]
-        if filename:
-            memo_bits.append(filename)
-        pending.append(
-            (
-                ticker or product,
-                period,
-                {
-                    "지급일": pay_raw.replace("/", "-"),
-                    "금융상품명": product,
-                    "증권사": "미래에셋증권",
-                    "소득구분": itype,
-                    "종목코드": ticker,
-                    "통화": "KRW",
-                    "외화지급액": 0.0,
-                    "외화원천세": 0.0,
-                    "환율": 0.0,
-                    "지급액": amount,
-                    "법인세": _to_number(m.group("corp")),
-                    "지방소득세": _to_number(m.group("local")),
-                    "메모": " / ".join(memo_bits),
-                },
-            )
-        )
+        row_dict: dict[str, Any] | None = None
+        ticker = ""
+        period = ""
+        if m:
+            amount = _to_number(m.group("amount"))
+            if amount == 0:
+                skipped_zero += 1
+                continue
+            tax = m.group("tax")
+            icode = int(m.group("icode"))
+            itype = _mirae_wh_income_type(tax, icode)
+            ticker = (m.group("ticker") or "").strip()
+            pstart = m.group("pstart") or ""
+            pay_raw = m.group("pay")
+            period = f"{pstart}~{pay_raw}" if pstart else pay_raw
+            nxt = lines[i + 1] if i + 1 < len(lines) else ""
+            product = _mirae_wh_product_name(ticker, nxt, tax, icode)
+            ym = m.group("ym").replace("/", "-")
+            memo_bits = [
+                "미래에셋증권 원천징수",
+                f"과세구분={tax}",
+                f"소득기간={period.replace('/', '-')}",
+                f"귀속년월={ym}",
+            ]
+            if filename:
+                memo_bits.append(filename)
+            row_dict = {
+                "지급일": pay_raw.replace("/", "-"),
+                "금융상품명": product,
+                "증권사": "미래에셋증권",
+                "소득구분": itype,
+                "종목코드": ticker,
+                "통화": "KRW",
+                "외화지급액": 0.0,
+                "외화원천세": 0.0,
+                "환율": 0.0,
+                "지급액": amount,
+                "법인세": _to_number(m.group("corp")),
+                "지방소득세": _to_number(m.group("local")),
+                "메모": " / ".join(memo_bits),
+            }
+            ticker = ticker or product
+        else:
+            ocr_row = _parse_mirae_wh_ocr_line(line)
+            if ocr_row is None:
+                continue
+            used_ocr_fallback = True
+            period = str(ocr_row.pop("_period", ocr_row.get("지급일", "")))
+            ticker = str(ocr_row.pop("_ticker", ocr_row.get("금융상품명", "")))
+            if filename and filename not in str(ocr_row.get("메모", "")):
+                ocr_row["메모"] = f"{ocr_row.get('메모', '')} / {filename}".strip(" /")
+            row_dict = ocr_row
+
+        pending.append((ticker or "미상", period, row_dict))
+
+    if used_ocr_fallback:
+        notes.append("스캔 PDF OCR 결과를 기반으로 행을 인식했습니다. 금액을 확인해 주세요.")
 
     rows, skipped_offset = _drop_zero_net_kb_groups(pending)
     negative_left = [r for r in rows if float(r["지급액"]) < 0]
