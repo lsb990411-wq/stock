@@ -43,10 +43,22 @@ import src.import_export as _import_export_mod
 
 # 로컬 개발 시 핫리로드 지원 — 클라우드/컨테이너 환경에선 매 렌더링 오버헤드 방지를 위해 스킵
 import os as _os
+from pathlib import Path as _Path
+
+def _running_on_streamlit_cloud() -> bool:
+    if _os.environ.get("USER") == "appuser":
+        return True
+    if _os.environ.get("STREAMLIT_SERVER_ENV") == "cloud":
+        return True
+    try:
+        return _Path(__file__).resolve().as_posix().startswith("/mount/")
+    except Exception:  # noqa: BLE001
+        return False
+
 _IS_LOCAL_DEV = not (
     _os.environ.get("VERCEL")
     or _os.environ.get("VERCEL_ENV")
-    or _os.environ.get("STREAMLIT_SERVER_ENV") == "cloud"
+    or _running_on_streamlit_cloud()
 )
 if _IS_LOCAL_DEV:
     import importlib

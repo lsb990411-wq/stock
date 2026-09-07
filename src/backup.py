@@ -34,11 +34,16 @@ _AUTO_MIN_HOURS = 12
 
 def is_ephemeral_host() -> bool:
     """Vercel/Streamlit Cloud 등 로컬 디스크가 휘발적인 환경."""
-    return bool(
-        os.environ.get("VERCEL")
-        or os.environ.get("VERCEL_ENV")
-        or os.environ.get("STREAMLIT_SERVER_ENV") == "cloud"
-    )
+    if os.environ.get("VERCEL") or os.environ.get("VERCEL_ENV"):
+        return True
+    if os.environ.get("STREAMLIT_SERVER_ENV") == "cloud":
+        return True
+    if os.environ.get("USER") == "appuser":
+        return True
+    try:
+        return Path(__file__).resolve().as_posix().startswith("/mount/")
+    except Exception:  # noqa: BLE001
+        return False
 
 
 @dataclass

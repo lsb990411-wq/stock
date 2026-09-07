@@ -1,4 +1,0 @@
-# Streamlit Community Cloud apt packages
-# 스캔(이미지) PDF OCR에 필요
-tesseract-ocr
-tesseract-ocr-kor
