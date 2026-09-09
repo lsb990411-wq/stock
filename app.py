@@ -445,7 +445,7 @@ DETAIL_TRADE_COLUMNS = [
     "종목명",
     "거래유형",
     "수량",
-    "잔여수량",
+    "원가잔액",
     "매수단가(외화)",
     "매수단가(원화)",
     "거래금액(외화)",
@@ -457,6 +457,41 @@ DETAIL_TRADE_COLUMNS = [
     "처분손익",
     "메모",
 ]
+
+
+def _attach_running_cost_basis(df: pd.DataFrame) -> pd.DataFrame:
+    """시간순 정렬된 거래에 FIFO 매매 후 원가잔액(잔여수량×매수단가 합)을 붙인다."""
+    if df is None or df.empty or not {"수량", "거래유형", "단가"}.issubset(df.columns):
+        return df
+    out = df.copy()
+    lots: list[list[float]] = []
+    cost_values: list[float] = []
+
+    for _, row in out.iterrows():
+        side_text = str(row.get("거래유형") or "")
+        qty = abs(float(pd.to_numeric(row.get("수량"), errors="coerce") or 0))
+        price = float(pd.to_numeric(row.get("단가"), errors="coerce") or 0)
+
+        if "배당" not in side_text:
+            try:
+                side_kind = _models_mod.normalize_side(side_text)
+            except ValueError:
+                side_kind = None
+            if side_kind == "BUY":
+                lots.append([qty, price])
+            elif side_kind == "SELL":
+                remaining = qty
+                while remaining > 1e-12 and lots:
+                    matched = min(lots[0][0], remaining)
+                    lots[0][0] -= matched
+                    remaining -= matched
+                    if lots[0][0] <= 1e-12:
+                        lots.pop(0)
+
+        cost_values.append(round(sum(lq * lp for lq, lp in lots), 0))
+
+    out["원가잔액"] = cost_values
+    return out
 
 
 def _attach_fifo_remainders(df: pd.DataFrame, trades: list) -> pd.DataFrame:
@@ -1051,7 +1086,7 @@ def show_stock_detail_modal(
     if period.get("start") and period.get("end"):
         st.caption(
             f"대시보드 조회 기간: **{period['start']} ~ {period['end']}** "
-            "(표는 기간 내 거래, 잔여수량·보유요약은 종료일 기준 FIFO)"
+            "(표는 기간 내 거래, 원가잔액·보유요약은 종료일 기준 FIFO)"
         )
 
     if df_stock_trades is None or df_stock_trades.empty:
@@ -1066,13 +1101,14 @@ def show_stock_detail_modal(
     if pending_toast:
         st.toast(str(pending_toast))
 
-    # FIFO 매수 잔여·매수단가 + 거래금액(외화/원화)
+    # FIFO 매수 잔여·매수단가 + 거래금액(외화/원화) + 매매 후 원가잔액
     fifo_src = all_trades if all_trades is not None else []
     enriched = _attach_trade_amounts(_attach_fifo_remainders(df_stock_trades, fifo_src))
 
-    display_cols = [c for c in DETAIL_TRADE_COLUMNS if c in enriched.columns]
-    # 팝업 표시 직전 시간순 재정렬
-    sorted_src = _sort_trades_chronologically(enriched)
+    display_cols = [c for c in DETAIL_TRADE_COLUMNS if c in [*enriched.columns, "원가잔액"]]
+    # 팝업 표시 직전 시간순 재정렬 → 원가잔액 누적
+    sorted_src = _attach_running_cost_basis(_sort_trades_chronologically(enriched))
+    display_cols = [c for c in DETAIL_TRADE_COLUMNS if c in sorted_src.columns]
     work = sorted_src.loc[
         :, [c for c in [*display_cols, "ID"] if c in sorted_src.columns]
     ].copy()
@@ -1142,10 +1178,10 @@ def show_stock_detail_modal(
     detail_col_config = {
         "거래일자": st.column_config.DateColumn("거래일자", format="YYYY-MM-DD"),
         "수량": st.column_config.NumberColumn("수량", format="%,.4f"),
-        "잔여수량": st.column_config.NumberColumn(
-            "잔여수량",
-            format="%,.4f",
-            help="해당 매수 건이 FIFO 매도 소진 후 남은 수량 (매도·배당 행은 비움, 전량 소진=0)",
+        "원가잔액": st.column_config.NumberColumn(
+            "원가잔액",
+            format="%,d 원",
+            help="해당 거래 직후 FIFO 잔여 매수원가 (잔여수량 × 매수단가, 수수료 제외)",
         ),
         "매수단가(외화)": st.column_config.NumberColumn(
             "매수단가(외화)",
@@ -1201,7 +1237,7 @@ def show_stock_detail_modal(
         )
 
     st.caption(
-        "매수 행의 **잔여수량**·**매수단가**는 FIFO 기준입니다. "
+        "각 행의 **원가잔액**은 해당 매매 직후 FIFO 잔여 원가입니다. "
         "**처분손익**은 매도 행에서 수정 후 Enter/포커스 아웃 시 자동 저장됩니다. "
         "자동 저장이 안 되면 아래 **처분손익 저장** 버튼을 눌러 주세요."
     )
@@ -1244,17 +1280,10 @@ def show_stock_detail_modal(
             help="매도 행만 수정 · Enter/포커스 아웃 시 저장 (비우면 FIFO 복귀)",
             step=1,
         ),
-        "ID": st.column_config.NumberColumn(
-            "ID",
-            format="%d",
-            disabled=True,
-            help="DB trades.id (저장 키)",
-            width="small",
-        ),
     }
-    # ID를 앞에 두어 매핑 확인이 쉽도록
-    col_order = ["ID"] + [c for c in editor_df.columns if c != "ID"]
-    editor_df = editor_df.loc[:, col_order]
+    # ID는 저장용으로만 유지하고 화면에서는 숨김
+    col_order = [c for c in editor_df.columns if c != "ID"]
+    editor_df = editor_df.loc[:, ["ID", *col_order] if "ID" in editor_df.columns else col_order]
 
     disabled_cols = [c for c in editor_df.columns if c != "처분손익"]
     edited = st.data_editor(
